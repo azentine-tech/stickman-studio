@@ -11,7 +11,7 @@ from PIL import Image
 
 # Page styling
 st.set_page_config(page_title="Production Scale Stickman Studio", layout="wide")
-st.title("🎬 Production Scale Stickman Studio (Gemini 3.5 & Imagen 3)")
+st.title("🎬 Production Scale Stickman Studio (Gemini 3.5 & Imagen 4)")
 st.write("Upload style examples, paste full transcripts, and generate styled assets in safe batches of 50.")
 
 # Sidebar for Setup & Styling Guardrails
@@ -232,9 +232,9 @@ with col_gen:
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
                     try:
-                        # FIXED: Removed the Enterprise 'person_generation' parameter
+                        # UPDATED: Changed model ID to imagen-4.0-generate-001
                         response = client.models.generate_images(
-                            model="imagen-3.0-generate-002",
+                            model="imagen-4.0-generate-001",
                             prompt=full_prompt,
                             config=types.GenerateImagesConfig(
                                 number_of_images=1,
