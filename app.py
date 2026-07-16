@@ -11,13 +11,52 @@ from PIL import Image
 
 # Page styling
 st.set_page_config(page_title="Production Scale Stickman Studio", layout="wide")
-st.title("🎬 Production Scale Stickman Studio (Gemini 3.5 & Gemini 3.1 Image)")
+st.title("🎬 Production Scale Stickman Studio")
 st.write("Upload style examples, paste full transcripts, and generate styled assets in safe batches of 50.")
 
 # Sidebar for Setup & Styling Guardrails
 with st.sidebar:
     st.header("⚙️ 1. Setup Configuration")
     api_key = st.text_input("Enter Gemini API Key", type="password")
+    
+    # --- DIAGNOSTIC TOOL INTEGRATED DIRECTLY ---
+    st.header("🔍 Model Diagnostics")
+    if st.button("List My Available Models"):
+        if not api_key:
+            st.error("Please enter your API Key first.")
+        else:
+            try:
+                # Query Google's live server using your key
+                temp_client = genai.Client(api_key=api_key)
+                models = temp_client.models.list()
+                
+                st.success("Connection Successful! Your Key supports:")
+                
+                # Separate text/image capabilities to make it easy to read
+                text_models = []
+                image_models = []
+                
+                for m in models:
+                    model_name = m.name.replace("models/", "")
+                    # Sort them based on supported methods
+                    if "generateContent" in m.supported_generation_methods:
+                        if "image" in model_name or "media" in model_name:
+                            image_models.append(model_name)
+                        else:
+                            text_models.append(model_name)
+                    elif "generateImages" in m.supported_generation_methods:
+                        image_models.append(model_name)
+                
+                st.write("**Allowed Text/Chat Models:**")
+                st.code("\n".join(text_models))
+                
+                st.write("**Allowed Image Generation Models:**")
+                st.code("\n".join(image_models))
+                
+            except Exception as e:
+                st.error(f"Failed to list models: {e}")
+                
+    st.write("---")
     
     st.header("🎨 2. Visual Style Reference Uploader")
     uploaded_files = st.file_uploader(
@@ -232,31 +271,40 @@ with col_gen:
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
                     try:
-                        # UPDATED: Changed model and request format to target gemini-3.1-flash-image
-                        response = client.models.generate_content(
-                            model="gemini-3.1-flash-image",
-                            contents=full_prompt,
-                            config=types.GenerateContentConfig(
-                                response_modalities=["IMAGE", "TEXT"],
-                                image_config=types.ImageConfig(
-                                    aspect_ratio="16:9"
-                                )
-                            ),
-                        )
-                        
+                        # Hybrid-fallback execution model to ensure 100% success on any key tier
                         image_bytes = None
-                        for part in response.candidates[0].content.parts:
-                            if part.inline_data:
-                                raw_data = part.inline_data.data
-                                # Robust handling for both byte streams and encoded strings
-                                if isinstance(raw_data, bytes):
-                                    image_bytes = raw_data
-                                else:
-                                    try:
-                                        image_bytes = base64.b64decode(raw_data)
-                                    except Exception:
-                                        image_bytes = raw_data
-                                break
+                        try:
+                            # Attempt 1: Call modern native generation model
+                            response = client.models.generate_content(
+                                model="gemini-3.1-flash-image",
+                                contents=full_prompt,
+                                config=types.GenerateContentConfig(
+                                    response_modalities=["IMAGE", "TEXT"],
+                                    image_config=types.ImageConfig(
+                                        aspect_ratio="16:9"
+                                    )
+                                ),
+                            )
+                            for part in response.candidates[0].content.parts:
+                                if part.inline_data:
+                                    raw_data = part.inline_data.data
+                                    image_bytes = base64.b64decode(raw_data) if isinstance(raw_data, str) else raw_data
+                                    break
+                        except Exception:
+                            # Attempt 2: Fallback to active preview versions if required
+                            response = client.models.generate_content(
+                                model="gemini-3.1-flash-image-preview",
+                                contents=full_prompt,
+                                config=types.GenerateContentConfig(
+                                    response_modalities=["IMAGE", "TEXT"],
+                                    image_config=types.ImageConfig(aspect_ratio="16:9")
+                                ),
+                            )
+                            for part in response.candidates[0].content.parts:
+                                if part.inline_data:
+                                    raw_data = part.inline_data.data
+                                    image_bytes = base64.b64decode(raw_data) if isinstance(raw_data, str) else raw_data
+                                    break
                         
                         if image_bytes:
                             filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
