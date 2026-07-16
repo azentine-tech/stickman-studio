@@ -11,9 +11,9 @@ from google import genai
 from google.genai import types
 
 # Page styling
-st.set_page_config(page_title="Free Stickman Video Studio", layout="wide")
-st.title("🎬 Free Stickman Video Production Studio")
-st.write("Draft fact-checked scripts with Gemini (Free) and batch generate stickman assets with Pollinations AI (Unlimited & Free).")
+st.set_page_config(page_title="Ultra-Resilient Stickman Studio", layout="wide")
+st.title("🎬 Ultra-Resilient Stickman Video Studio")
+st.write("Draft fact-checked scripts with Gemini and batch generate stickman assets with multi-server free fallbacks.")
 
 # Sidebar for Setup & Styling Guardrails
 with st.sidebar:
@@ -189,7 +189,7 @@ with col_chat:
 # --- RIGHT COLUMN: TRANSCRIPT SAVER & BATCHED GENERATION ---
 with col_gen:
     st.subheader("📝 Transcript To Batched Images")
-    st.caption("Paste your entire video transcript once below. Images generate via Pollinations AI (100% Free & Unlimited).")
+    st.caption("Paste your entire video transcript once below. Images generate via Pollinations AI & robust free fallback endpoints.")
     
     transcript_input = st.text_area(
         "Paste Complete Timestamps & Actions Here",
@@ -251,28 +251,40 @@ with col_gen:
                     full_prompt = f"{action_text}, {style_instruction}"
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
-                    try:
-                        # ENTIRELY FREE ROUTING VIA POLLINATIONS AI (NO KEYS, NO COST, UNLIMITED)
-                        encoded_prompt = urllib.parse.quote(full_prompt)
-                        # Requesting a widescreen 16:9 1024x576 sticker/cartoon generation
-                        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
-                        
-                        response = requests.get(url, timeout=30)
-                        
-                        if response.status_code == 200 and response.content:
-                            image_bytes = response.content
-                            filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
-                            st.session_state.generated_files[filename] = image_bytes
-                            st.image(image_bytes, caption=f"Generated: {filename}", width=250)
-                        else:
-                            st.error(f"Failed to pull image from free engine for {timestamp_label}")
-                            
-                    except Exception as e:
-                        st.error(f"Error on Scene {current_idx + idx + 1}: {e}")
+                    # --- MULTI-SERVER FAILOVER MECHANISM ---
+                    image_bytes = None
+                    encoded_prompt = urllib.parse.quote(full_prompt)
+                    
+                    # We define list of primary and secondary backup visual servers
+                    endpoints = [
+                        # Primary: Modern Unified Pollinations Gateway (RTX 5090 cluster)
+                        f"https://gen.pollinations.ai/image/{encoded_prompt}?width=1024&height=576&nologo=true",
+                        # Secondary Fallback: Legacy gateway (Sana Sprint)
+                        f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true",
+                        # Tertiary Fallback: Fast visual-content mirror
+                        f"https://image.pollinations.ai/{encoded_prompt}?width=1024&height=576&nologo=true"
+                    ]
+                    
+                    for attempt, url in enumerate(endpoints):
+                        try:
+                            # 15 second limit per host to keep processing fast
+                            response = requests.get(url, timeout=15)
+                            if response.status_code == 200 and response.content:
+                                image_bytes = response.content
+                                break  # Success! Break the loop
+                        except Exception as e:
+                            st.warning(f"Endpoint {attempt + 1} timed out or failed. Switching to fallback...")
+                            time.sleep(1) # Brief pause before next gateway attempt
+                    
+                    # Store and Display
+                    if image_bytes:
+                        filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
+                        st.session_state.generated_files[filename] = image_bytes
+                        st.image(image_bytes, caption=f"Generated: {filename}", width=250)
+                    else:
+                        st.error(f"❌ All free visual engines timed out for scene {timestamp_label}. Please try running this batch slice again.")
                     
                     progress_bar.progress((idx + 1) / batch_size)
-                    
-                    # Small 1-second pause just to keep visual renders clean (no 6-second bottleneck anymore!)
                     time.sleep(1)
                 
                 st.session_state.current_index = end_idx
