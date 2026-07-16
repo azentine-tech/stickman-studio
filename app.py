@@ -4,51 +4,22 @@ import time
 import io
 import zipfile
 import re
+import requests
+import urllib.parse
 from datetime import datetime
 from google import genai
 from google.genai import types
-from PIL import Image
 
 # Page styling
-st.set_page_config(page_title="Production Scale Stickman Studio", layout="wide")
-st.title("🎬 Production Scale Stickman Studio")
-st.write("Upload style examples, paste full transcripts, and generate styled assets in safe batches of 50.")
+st.set_page_config(page_title="Free Stickman Video Studio", layout="wide")
+st.title("🎬 Free Stickman Video Production Studio")
+st.write("Draft fact-checked scripts with Gemini (Free) and batch generate stickman assets with Pollinations AI (Unlimited & Free).")
 
 # Sidebar for Setup & Styling Guardrails
 with st.sidebar:
     st.header("⚙️ 1. Setup Configuration")
-    api_key = st.text_input("Enter Gemini API Key", type="password")
+    api_key = st.text_input("Enter Gemini API Key (Required for Chat/Research only)", type="password")
     
-    # --- DIAGNOSTIC TOOL INTEGRATED DIRECTLY ---
-    st.header("🔍 Model Diagnostics")
-    if st.button("List My Available Models"):
-        if not api_key:
-            st.error("Please enter your API Key first.")
-        else:
-            try:
-                temp_client = genai.Client(api_key=api_key)
-                models = temp_client.models.list()
-                st.success("Connection Successful! Your Key supports:")
-                
-                text_models = []
-                image_models = []
-                for m in models:
-                    model_name = m.name.replace("models/", "")
-                    if "generateContent" in m.supported_generation_methods:
-                        if "image" in model_name or "media" in model_name:
-                            image_models.append(model_name)
-                        else:
-                            text_models.append(model_name)
-                    elif "generateImages" in m.supported_generation_methods:
-                        image_models.append(model_name)
-                
-                st.write("**Allowed Text/Chat Models:**")
-                st.code("\n".join(text_models))
-                st.write("**Allowed Image Generation Models:**")
-                st.code("\n".join(image_models))
-            except Exception as e:
-                st.error(f"Failed to list models: {e}")
-                
     st.write("---")
     
     st.header("🎨 2. Visual Style Reference Uploader")
@@ -97,6 +68,7 @@ if st.sidebar.button("Retrieve Work"):
                         action = match.group(2).strip()
                         restored_scenes.append({"timestamp": timestamp, "action": action})
             st.session_state.all_scenes = restored_scenes
+            st.session_state.current_index = 0
             st.sidebar.success(f"Successfully recovered {len(restored_scenes)} scenes!")
             st.rerun()
         except Exception as err:
@@ -105,6 +77,7 @@ if st.sidebar.button("Retrieve Work"):
 client = None
 chat_session = None
 
+# Initialize Chat Client (Gemini 3.5 Free Text)
 if api_key:
     try:
         client = genai.Client(api_key=api_key)
@@ -216,7 +189,7 @@ with col_chat:
 # --- RIGHT COLUMN: TRANSCRIPT SAVER & BATCHED GENERATION ---
 with col_gen:
     st.subheader("📝 Transcript To Batched Images")
-    st.caption("Paste your entire video transcript once below. The AI will store it and let you process generations in batches of 50.")
+    st.caption("Paste your entire video transcript once below. Images generate via Pollinations AI (100% Free & Unlimited).")
     
     transcript_input = st.text_area(
         "Paste Complete Timestamps & Actions Here",
@@ -265,7 +238,7 @@ with col_gen:
         # Button: Execute Batch of 50
         if current_idx < total_scenes:
             btn_label = f"🚀 Execute Batch (Generate Scenes {current_idx+1} to {end_idx})"
-            if st.button(btn_label, disabled=not client):
+            if st.button(btn_label):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
@@ -279,52 +252,28 @@ with col_gen:
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
                     try:
-                        image_bytes = None
-                        try:
-                            # Primary Native Preview Visual Model (Highly optimized for free tier testing)
-                            response = client.models.generate_content(
-                                model="gemini-3.1-flash-image-preview",
-                                contents=full_prompt,
-                                config=types.GenerateContentConfig(
-                                    response_modalities=["IMAGE", "TEXT"],
-                                    image_config=types.ImageConfig(aspect_ratio="16:9")
-                                ),
-                            )
-                            for part in response.candidates[0].content.parts:
-                                if part.inline_data:
-                                    raw_data = part.inline_data.data
-                                    image_bytes = base64.b64decode(raw_data) if isinstance(raw_data, str) else raw_data
-                                    break
-                        except Exception:
-                            # Fallback Model: Flash-Lite Image Generation
-                            response = client.models.generate_content(
-                                model="gemini-3.1-flash-lite-image",
-                                contents=full_prompt,
-                                config=types.GenerateContentConfig(
-                                    response_modalities=["IMAGE", "TEXT"],
-                                    image_config=types.ImageConfig(aspect_ratio="16:9")
-                                ),
-                            )
-                            for part in response.candidates[0].content.parts:
-                                if part.inline_data:
-                                    raw_data = part.inline_data.data
-                                    image_bytes = base64.b64decode(raw_data) if isinstance(raw_data, str) else raw_data
-                                    break
+                        # ENTIRELY FREE ROUTING VIA POLLINATIONS AI (NO KEYS, NO COST, UNLIMITED)
+                        encoded_prompt = urllib.parse.quote(full_prompt)
+                        # Requesting a widescreen 16:9 1024x576 sticker/cartoon generation
+                        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
                         
-                        if image_bytes:
+                        response = requests.get(url, timeout=30)
+                        
+                        if response.status_code == 200 and response.content:
+                            image_bytes = response.content
                             filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
                             st.session_state.generated_files[filename] = image_bytes
                             st.image(image_bytes, caption=f"Generated: {filename}", width=250)
                         else:
-                            st.error(f"Empty payload on scene {timestamp_label}")
+                            st.error(f"Failed to pull image from free engine for {timestamp_label}")
                             
                     except Exception as e:
                         st.error(f"Error on Scene {current_idx + idx + 1}: {e}")
                     
                     progress_bar.progress((idx + 1) / batch_size)
                     
-                    if idx < batch_size - 1:
-                        time.sleep(6)
+                    # Small 1-second pause just to keep visual renders clean (no 6-second bottleneck anymore!)
+                    time.sleep(1)
                 
                 st.session_state.current_index = end_idx
                 st.success("Batch Complete!")
