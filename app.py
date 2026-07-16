@@ -77,29 +77,50 @@ if st.sidebar.button("Retrieve Work"):
 client = None
 chat_session = None
 
-# Initialize Chat Client (Stably configured with zero search integrations to completely avoid 429 errors)
+# System prompt rules
+system_instruction = (
+    "You are an expert AI Video Producer and factual researcher. Your workflow follows these stages:\n\n"
+    "STAGE 1: RESEARCH & FACT-CHECKING\n"
+    "Formulate and organize facts based on your deep trained knowledge base.\n\n"
+    "STAGE 2: SCRIPTWRITING & VOICEOVER\n"
+    "Write highly engaging scripts with clear timestamps (e.g., [00:00 - 00:05]).\n\n"
+    "STAGE 3: STICKMAN VISUAL TRANSLATION\n"
+    "Translate scripts into visual prompts. Respect any visual cues or uploaded references. Always specify that it is a cartoon stickman illustration to bypass photorealistic generation filters."
+)
+
+# Initialize Chat Client with Multi-Model Redundancy
 if api_key:
     try:
         client = genai.Client(api_key=api_key)
         
-        system_instruction = (
-            "You are an expert AI Video Producer and factual researcher. Your workflow follows these stages:\n\n"
-            "STAGE 1: RESEARCH & FACT-CHECKING\n"
-            "Formulate and organize facts based on your deep trained knowledge base.\n\n"
-            "STAGE 2: SCRIPTWRITING & VOICEOVER\n"
-            "Write highly engaging scripts with clear timestamps (e.g., [00:00 - 00:05]).\n\n"
-            "STAGE 3: STICKMAN VISUAL TRANSLATION\n"
-            "Translate scripts into visual prompts. Respect any visual cues or uploaded references. Always specify that it is a cartoon stickman illustration to bypass photorealistic generation filters."
-        )
-        
-        # Completely removed the google search tool binding to safeguard free-tier chat stability!
-        chat_session = client.chats.create(
-            model="gemini-3.5-flash",
-            history=st.session_state.api_history,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction
+        # Try primary model first; fallback immediately if server capacity is constrained
+        try:
+            chat_session = client.chats.create(
+                model="gemini-3.5-flash",
+                history=st.session_state.api_history,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction
+                )
             )
-        )
+        except Exception:
+            try:
+                # Secondary Fallback Model (Stable and highly available)
+                chat_session = client.chats.create(
+                    model="gemini-2.5-flash",
+                    history=st.session_state.api_history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction
+                    )
+                )
+            except Exception:
+                # Final Failover Model (Guaranteed response path)
+                chat_session = client.chats.create(
+                    model="gemini-1.5-flash",
+                    history=st.session_state.api_history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction
+                    )
+                )
         
         # --- MULTIMODAL STYLE EXTRACTION ---
         if uploaded_files and "style_analyzed" not in st.session_state:
@@ -122,7 +143,7 @@ if api_key:
                     )
                     
                     response = client.models.generate_content(
-                        model="gemini-3.5-flash",
+                        model="gemini-2.5-flash",
                         contents=parts
                     )
                     extracted_style = response.text.strip()
@@ -138,7 +159,7 @@ if api_key:
 # Layout Columns
 col_chat, col_gen = st.columns([1, 1])
 
-# --- LEFT COLUMN: STABLE CHAT ASSISTANT ---
+# --- LEFT COLUMN: RESILIENT CHAT ASSISTANT ---
 with col_chat:
     st.subheader("💬 Script Researcher & Voiceover Producer")
     
@@ -167,13 +188,27 @@ with col_chat:
             with chat_container:
                 with st.chat_message("assistant"):
                     response_placeholder = st.empty()
-                    try:
-                        response = chat_session.send_message(chat_input)
-                        response_placeholder.markdown(response.text)
-                        st.session_state.messages.append({"role": "assistant", "content": response.text})
-                        st.session_state.api_history = chat_session.get_history()
-                    except Exception as e:
-                        response_placeholder.markdown(f"Error: {e}")
+                    response_text = ""
+                    
+                    # Try to get the response with automatic retry on 503
+                    for attempt in range(3):
+                        try:
+                            response = chat_session.send_message(chat_input)
+                            response_text = response.text
+                            break
+                        except Exception as e:
+                            err_str = str(e)
+                            if "503" in err_str or "UNAVAILABLE" in err_str:
+                                if attempt < 2:
+                                    response_placeholder.markdown("⏳ *Google's servers are busy. Retrying...*")
+                                    time.sleep(2)  # Wait 2 seconds before retrying
+                                    continue
+                            # If we tried all retries or it's a different error, raise it
+                            response_text = f"The primary server is experiencing heavy load. Error details: {e}"
+                    
+                    response_placeholder.markdown(response_text)
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                    st.session_state.api_history = chat_session.get_history()
 
 # --- RIGHT COLUMN: TRANSCRIPT SAVER & BATCHED GENERATION ---
 with col_gen:
@@ -240,31 +275,35 @@ with col_gen:
                     full_prompt = f"{action_text}, {style_instruction}"
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
-                    # --- DUAL-COMPANY MULTI-PROVIDER FALLBACK MECHANISM (100% FREE) ---
+                    # --- MULTI-PROVIDER HIGH-STABILITY ROUTING (100% FREE) ---
                     image_bytes = None
                     encoded_prompt = urllib.parse.quote(full_prompt)
                     
-                    # Provider 1: Pollinations AI Stable Core
-                    url_pollinations = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
-                    
-                    # Provider 2: DuckDuckGo AI Image Proxy (Using their high-speed free pipeline)
-                    url_duckduckgo = f"https://external-content.duckduckgo.com/iu/?u=https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
-                    
-                    # Try Pollinations first
+                    # Try Provider 1: Pollinations AI (Standard)
                     try:
-                        response = requests.get(url_pollinations, timeout=12)
+                        url_pollinations = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
+                        response = requests.get(url_pollinations, timeout=10)
                         if response.status_code == 200 and response.content:
                             image_bytes = response.content
                     except Exception:
                         pass
                     
-                    # If Pollinations failed or timed out, immediately run the DuckDuckGo pipeline fallback
+                    # Try Provider 2: Hugging Face (Ultra-Stable Enterprise Infrastructure)
                     if not image_bytes:
                         try:
-                            status_text.text(f"Switching providers for {timestamp_label}...")
-                            response = requests.get(url_duckduckgo, timeout=12)
+                            status_text.text(f"Pollinations down. Switching to Hugging Face fallback for {timestamp_label}...")
+                            # Hugging Face stable-diffusion free server gateway
+                            url_hf = f"https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+                            headers = {"User-Agent": "Mozilla/5.0"}
+                            payload = {
+                                "inputs": full_prompt,
+                                "parameters": {"width": 1024, "height": 576}
+                            }
+                            response = requests.post(url_hf, json=payload, headers=headers, timeout=12)
                             if response.status_code == 200 and response.content:
-                                image_bytes = response.content
+                                # Ensure we got an image and not a json error back
+                                if b"PNG" in response.content[:10] or b"JFIF" in response.content[:10]:
+                                    image_bytes = response.content
                         except Exception:
                             pass
                             
