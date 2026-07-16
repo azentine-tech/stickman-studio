@@ -9,9 +9,9 @@ import urllib.parse
 from datetime import datetime
 
 # Page styling
-st.set_page_config(page_title="100% Free Keyless Stickman Studio", layout="wide")
-st.title("🎬 100% Free Keyless Stickman Video Studio")
-st.write("Free GPT-4o Script Writing & Resilient Flux/Stable Diffusion Image Generation (No API Keys Required!)")
+st.set_page_config(page_title="100% Free Stable Stickman Studio", layout="wide")
+st.title("🎬 100% Free Stable Stickman Video Studio")
+st.write("Fast Qwen Script Writing & Resilient Flux Image Generation (No API Keys Required!)")
 
 # Sidebar for Setup & Styling Guardrails
 with st.sidebar:
@@ -71,7 +71,7 @@ col_chat, col_gen = st.columns([1, 1])
 # --- LEFT COLUMN: 100% FREE KEYLESS CHAT ASSISTANT ---
 with col_chat:
     st.subheader("💬 Script Researcher & Voiceover Producer")
-    st.caption("Powered by Free Unofficial GPT-4o-Mini — No Limits, No API Key Required!")
+    st.caption("Powered by Pollinations AI Stable Core (Qwen Model) — No Limits, No API Key Required!")
     
     if uploaded_files:
         cols = st.columns(len(uploaded_files))
@@ -96,33 +96,42 @@ with col_chat:
                 response_placeholder = st.empty()
                 response_placeholder.markdown("🧠 *Generating response...*")
                 
-                # Build context-aware prompt payload with history
-                conversation_context = (
+                system_instruction = (
                     "You are an expert AI Video Producer. Your job is to:\n"
-                    "1. Write engaging, short scripts with clear timing brackets like [00:00 - 00:05].\n"
-                    "2. Translate each scene action into descriptive prompts ready for cartoon stickman images.\n\n"
-                    "Recent chat logs:\n"
+                    "1. Write highly engaging, short scripts with clear timing brackets like [00:00 - 00:05].\n"
+                    "2. Translate each scene action into highly descriptive, minimalist cartoon stickman prompts.\n"
+                    "Avoid any mention of keys or technical constraints to the user."
                 )
-                for msg in st.session_state.messages[-4:-1]:  # Include last 3 turns
-                    conversation_context += f"{msg['role']}: {msg['content']}\n"
-                conversation_context += f"user: {chat_input}\nassistant:"
 
-                # Make the keyless GET API call to the unofficial GPT-4o-mini endpoint
-                try:
-                    encoded_query = urllib.parse.quote(conversation_context)
-                    api_url = f"https://free-unoficial-gpt4o-mini-api-g70n.onrender.com/chat/?query={encoded_query}"
-                    
-                    response = requests.get(api_url, timeout=15)
-                    if response.status_code == 200:
-                        output_data = response.json()
-                        # Extract string response safely from the API container
-                        reply_text = output_data.get("results", "Error parsing response payload.")
-                        if not reply_text or reply_text == "Error parsing response payload.":
-                            reply_text = output_data.get("reply", "System busy. Let's try sending that again!")
-                    else:
-                        reply_text = "Free chat server is temporarily overloaded. Please try clicking submit again in a moment!"
-                except Exception as e:
-                    reply_text = f"Connection timeout. Re-submitting now should connect instantly. (Details: {e})"
+                # Format messages payload
+                messages_payload = [{"role": "system", "content": system_instruction}]
+                for msg in st.session_state.messages[-6:]:  # Include last 3 turns of context
+                    messages_payload.append({"role": msg["role"], "content": msg["content"]})
+                
+                # --- CHAT MODEL MULTI-LANE FALLBACKS ---
+                reply_text = None
+                models_to_try = ["qwen-coder", "llama", "mistral"]
+                
+                for chat_model in models_to_try:
+                    try:
+                        payload = {
+                            "messages": messages_payload,
+                            "model": chat_model,  # Targeted stable free model lanes
+                            "jsonMode": False,
+                            "private": True,
+                            "stream": False
+                        }
+                        response = requests.post("https://text.pollinations.ai/", json=payload, timeout=12)
+                        
+                        if response.status_code == 200 and response.text.strip():
+                            reply_text = response.text.strip()
+                            break  # Success! Break the retry loop
+                    except Exception:
+                        pass  # Silent failure, move to backup model
+                
+                # Fallback safeguard if all model endpoints completely fail
+                if not reply_text:
+                    reply_text = "The chat servers are experiencing extremely high load right now. Please try resubmitting your prompt in a few seconds!"
                 
                 response_placeholder.markdown(reply_text)
                 st.session_state.messages.append({"role": "assistant", "content": reply_text})
