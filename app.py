@@ -87,7 +87,6 @@ recovery_data = st.sidebar.text_area("Paste Raw Backup Data Here", placeholder="
 if st.sidebar.button("Retrieve Work"):
     if recovery_data:
         try:
-            # Reconstruct the scenes list from the text block
             restored_scenes = []
             lines = recovery_data.split("\n")
             for line in lines:
@@ -282,8 +281,9 @@ with col_gen:
                     try:
                         image_bytes = None
                         try:
+                            # Primary Native Preview Visual Model (Highly optimized for free tier testing)
                             response = client.models.generate_content(
-                                model="gemini-3.1-flash-image",
+                                model="gemini-3.1-flash-image-preview",
                                 contents=full_prompt,
                                 config=types.GenerateContentConfig(
                                     response_modalities=["IMAGE", "TEXT"],
@@ -296,8 +296,9 @@ with col_gen:
                                     image_bytes = base64.b64decode(raw_data) if isinstance(raw_data, str) else raw_data
                                     break
                         except Exception:
+                            # Fallback Model: Flash-Lite Image Generation
                             response = client.models.generate_content(
-                                model="gemini-3.1-flash-image-preview",
+                                model="gemini-3.1-flash-lite-image",
                                 contents=full_prompt,
                                 config=types.GenerateContentConfig(
                                     response_modalities=["IMAGE", "TEXT"],
