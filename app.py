@@ -26,19 +26,14 @@ with st.sidebar:
             st.error("Please enter your API Key first.")
         else:
             try:
-                # Query Google's live server using your key
                 temp_client = genai.Client(api_key=api_key)
                 models = temp_client.models.list()
-                
                 st.success("Connection Successful! Your Key supports:")
                 
-                # Separate text/image capabilities to make it easy to read
                 text_models = []
                 image_models = []
-                
                 for m in models:
                     model_name = m.name.replace("models/", "")
-                    # Sort them based on supported methods
                     if "generateContent" in m.supported_generation_methods:
                         if "image" in model_name or "media" in model_name:
                             image_models.append(model_name)
@@ -49,10 +44,8 @@ with st.sidebar:
                 
                 st.write("**Allowed Text/Chat Models:**")
                 st.code("\n".join(text_models))
-                
                 st.write("**Allowed Image Generation Models:**")
                 st.code("\n".join(image_models))
-                
             except Exception as e:
                 st.error(f"Failed to list models: {e}")
                 
@@ -65,7 +58,6 @@ with st.sidebar:
         accept_multiple_files=True
     )
     
-    # Restrict to maximum 3 files
     if len(uploaded_files) > 3:
         st.warning("Only the first 3 images will be used for style reference.")
         uploaded_files = uploaded_files[:3]
@@ -76,30 +68,48 @@ with st.sidebar:
     style_instruction = style_instruction_box.text_area("Calculated Style Guidance", value=default_style)
 
 # --- IN-MEMORY SESSION PERSISTENCE ---
-# All scenes parsed from transcript
 if "all_scenes" not in st.session_state:
     st.session_state.all_scenes = []
-# Global storage for generated images: { filename: bytes }
 if "generated_files" not in st.session_state:
     st.session_state.generated_files = {}
-# Current progress pointer
 if "current_index" not in st.session_state:
     st.session_state.current_index = 0
-# Chat message logs
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "api_history" not in st.session_state:
     st.session_state.api_history = []
 
+# --- RECOVERY RE-LOADER ---
+st.sidebar.write("---")
+st.sidebar.header("💾 4. Session Recovery Center")
+st.sidebar.write("If you refreshed the page, paste your backup data below to recover your work instantly.")
+recovery_data = st.sidebar.text_area("Paste Raw Backup Data Here", placeholder="Paste backup text...")
+if st.sidebar.button("Retrieve Work"):
+    if recovery_data:
+        try:
+            # Reconstruct the scenes list from the text block
+            restored_scenes = []
+            lines = recovery_data.split("\n")
+            for line in lines:
+                if line.strip():
+                    match = re.match(r"^\[(.*?)\]\s*(.*)$", line.strip())
+                    if match:
+                        timestamp = match.group(1).replace(":", "_").replace(" ", "")
+                        action = match.group(2).strip()
+                        restored_scenes.append({"timestamp": timestamp, "action": action})
+            st.session_state.all_scenes = restored_scenes
+            st.sidebar.success(f"Successfully recovered {len(restored_scenes)} scenes!")
+            st.rerun()
+        except Exception as err:
+            st.sidebar.error(f"Failed to parse recovery text: {err}")
+
 client = None
 chat_session = None
 
-# Initialize Client
 if api_key:
     try:
         client = genai.Client(api_key=api_key)
         
-        # Guide the AI chat
         system_instruction = (
             "You are an expert AI Video Producer and factual researcher. Your workflow follows these stages:\n\n"
             "STAGE 1: RESEARCH & FACT-CHECKING\n"
@@ -130,7 +140,6 @@ if api_key:
                     parts = []
                     for uf in uploaded_files:
                         bytes_data = uf.read()
-                        # Reset seek pointer so user can preview them
                         uf.seek(0)
                         parts.append(
                             types.Part.from_bytes(
@@ -150,7 +159,6 @@ if api_key:
                     )
                     extracted_style = response.text.strip()
                     st.session_state.style_analyzed = extracted_style
-                    # Update style prompt textarea on the screen
                     style_instruction = style_instruction_box.text_area("Calculated Style Guidance", value=extracted_style)
                     st.sidebar.success("Style Reference analyzed successfully!")
                 except Exception as ex:
@@ -166,21 +174,18 @@ col_chat, col_gen = st.columns([1, 1])
 with col_chat:
     st.subheader("💬 Script Researcher & Voiceover Producer")
     
-    # Preview uploaded reference files
     if uploaded_files:
         cols = st.columns(len(uploaded_files))
         for idx, uf in enumerate(uploaded_files):
             with cols[idx]:
                 st.image(uf, caption=f"Style Ref {idx+1}", use_container_width=True)
                 
-    # Message Container
     chat_container = st.container(height=400)
     with chat_container:
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # Chat input box
     if chat_input := st.chat_input("E.g., 'Research how bees make honey and write a transcript.'"):
         with chat_container:
             with st.chat_message("user"):
@@ -196,7 +201,6 @@ with col_chat:
                     response_placeholder = st.empty()
                     try:
                         response = chat_session.send_message(chat_input)
-                        
                         response_text = response.text
                         if response.candidates and response.candidates[0].grounding_metadata:
                             metadata = response.candidates[0].grounding_metadata
@@ -221,7 +225,6 @@ with col_gen:
         height=150
     )
     
-    # Button to Parse & Lock in Transcript
     if st.button("💾 Save Transcript"):
         if transcript_input.strip():
             parsed_scenes = []
@@ -238,7 +241,7 @@ with col_gen:
                         parsed_scenes.append({"timestamp": f"scene_{fallback_time}", "action": line.strip()})
             
             st.session_state.all_scenes = parsed_scenes
-            st.session_state.current_index = 0  # Reset pointer to the start
+            st.session_state.current_index = 0  
             st.success(f"Transcript Saved! Parsed **{len(parsed_scenes)}** scenes. Ready to generate.")
         else:
             st.error("Transcript cannot be empty.")
@@ -253,6 +256,13 @@ with col_gen:
         end_idx = min(current_idx + 50, total_scenes)
         batch_size = end_idx - current_idx
         
+        # --- SHOW BACKUP COPY-PASTE UTILITY ---
+        st.info("💡 **Keep a backup of your work:** If you're worried about accidental page refreshes, copy the text below and keep it in a notepad.")
+        backup_text = ""
+        for s in st.session_state.all_scenes:
+            backup_text += f"[{s['timestamp']}] {s['action']}\n"
+        st.text_area("Highlight and Copy this backup code:", value=backup_text.strip(), height=80)
+        
         # Button: Execute Batch of 50
         if current_idx < total_scenes:
             btn_label = f"🚀 Execute Batch (Generate Scenes {current_idx+1} to {end_idx})"
@@ -260,7 +270,6 @@ with col_gen:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # Fetch only current batch scenes
                 batch_scenes = st.session_state.all_scenes[current_idx:end_idx]
                 
                 for idx, scene in enumerate(batch_scenes):
@@ -271,18 +280,14 @@ with col_gen:
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
                     try:
-                        # Hybrid-fallback execution model to ensure 100% success on any key tier
                         image_bytes = None
                         try:
-                            # Attempt 1: Call modern native generation model
                             response = client.models.generate_content(
                                 model="gemini-3.1-flash-image",
                                 contents=full_prompt,
                                 config=types.GenerateContentConfig(
                                     response_modalities=["IMAGE", "TEXT"],
-                                    image_config=types.ImageConfig(
-                                        aspect_ratio="16:9"
-                                    )
+                                    image_config=types.ImageConfig(aspect_ratio="16:9")
                                 ),
                             )
                             for part in response.candidates[0].content.parts:
@@ -291,7 +296,6 @@ with col_gen:
                                     image_bytes = base64.b64decode(raw_data) if isinstance(raw_data, str) else raw_data
                                     break
                         except Exception:
-                            # Attempt 2: Fallback to active preview versions if required
                             response = client.models.generate_content(
                                 model="gemini-3.1-flash-image-preview",
                                 contents=full_prompt,
@@ -308,11 +312,7 @@ with col_gen:
                         
                         if image_bytes:
                             filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
-                            
-                            # Save globally to the session state
                             st.session_state.generated_files[filename] = image_bytes
-                            
-                            # Render image locally on screen
                             st.image(image_bytes, caption=f"Generated: {filename}", width=250)
                         else:
                             st.error(f"Empty payload on scene {timestamp_label}")
@@ -322,11 +322,9 @@ with col_gen:
                     
                     progress_bar.progress((idx + 1) / batch_size)
                     
-                    # Pause for 6 seconds to stay safely under API rate limits
                     if idx < batch_size - 1:
                         time.sleep(6)
                 
-                # Advance the pointer
                 st.session_state.current_index = end_idx
                 st.success("Batch Complete!")
                 st.rerun()
@@ -340,7 +338,6 @@ with col_gen:
         st.subheader("📥 Download Studio Assets")
         st.write(f"Currently compiled images in storage: **{len(st.session_state.generated_files)}**")
         
-        # Build ZIP File in RAM
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zip_file:
             for fname, fbytes in st.session_state.generated_files.items():
