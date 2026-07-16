@@ -11,7 +11,7 @@ from PIL import Image
 
 # Page styling
 st.set_page_config(page_title="Production Scale Stickman Studio", layout="wide")
-st.title("🎬 Production Scale Stickman Studio (Gemini 3.5 & Imagen 4)")
+st.title("🎬 Production Scale Stickman Studio (Gemini 3.5 & Gemini 3.1 Image)")
 st.write("Upload style examples, paste full transcripts, and generate styled assets in safe batches of 50.")
 
 # Sidebar for Setup & Styling Guardrails
@@ -232,19 +232,31 @@ with col_gen:
                     status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
                     
                     try:
-                        # UPDATED: Changed model ID to imagen-4.0-generate-001
-                        response = client.models.generate_images(
-                            model="imagen-4.0-generate-001",
-                            prompt=full_prompt,
-                            config=types.GenerateImagesConfig(
-                                number_of_images=1,
-                                aspect_ratio="16:9"
-                            )
+                        # UPDATED: Changed model and request format to target gemini-3.1-flash-image
+                        response = client.models.generate_content(
+                            model="gemini-3.1-flash-image",
+                            contents=full_prompt,
+                            config=types.GenerateContentConfig(
+                                response_modalities=["IMAGE", "TEXT"],
+                                image_config=types.ImageConfig(
+                                    aspect_ratio="16:9"
+                                )
+                            ),
                         )
                         
                         image_bytes = None
-                        if response.generated_images:
-                            image_bytes = response.generated_images[0].image.image_bytes
+                        for part in response.candidates[0].content.parts:
+                            if part.inline_data:
+                                raw_data = part.inline_data.data
+                                # Robust handling for both byte streams and encoded strings
+                                if isinstance(raw_data, bytes):
+                                    image_bytes = raw_data
+                                else:
+                                    try:
+                                        image_bytes = base64.b64decode(raw_data)
+                                    except Exception:
+                                        image_bytes = raw_data
+                                break
                         
                         if image_bytes:
                             filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
@@ -266,7 +278,7 @@ with col_gen:
                     if idx < batch_size - 1:
                         time.sleep(6)
                 
-                # Advance the persistent pointer after completing the batch
+                # Advance the pointer
                 st.session_state.current_index = end_idx
                 st.success("Batch Complete!")
                 st.rerun()
