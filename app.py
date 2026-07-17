@@ -74,19 +74,21 @@ def describe_style_from_images(image_files):
     payload = {
         "model": "openai",
         "messages": [{"role": "user", "content": content}],
-        "jsonMode": False,
-        "private": True,
-        "stream": False,
     }
     try:
-        resp = requests.post(f"{POLLINATIONS_TEXT_URL}openai", json=payload, timeout=40)
+        resp = requests.post(
+            f"{POLLINATIONS_TEXT_URL}openai",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=40,
+        )
         if resp.status_code == 200:
             data = resp.json()
             text = data["choices"][0]["message"]["content"].strip()
             if text:
                 return text, None
             return None, "Vision model returned an empty description."
-        return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
     except Exception as e:
         return None, f"Request failed: {e}"
 
@@ -250,21 +252,25 @@ def narration_to_visual_prompt(narration, retries=2):
         "illustrator could draw to represent the idea."
     )
     payload = {
+        "model": "openai",
         "messages": [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": narration},
         ],
-        "model": "openai",
-        "jsonMode": False,
-        "private": True,
-        "stream": False,
     }
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(POLLINATIONS_TEXT_URL, json=payload, timeout=20)
-            if resp.status_code == 200 and resp.text.strip():
-                cleaned = resp.text.strip().strip('"')
-                return cleaned
+            resp = requests.post(
+                f"{POLLINATIONS_TEXT_URL}openai",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                cleaned = data["choices"][0]["message"]["content"].strip().strip('"')
+                if cleaned:
+                    return cleaned
         except Exception:
             pass
         time.sleep(2)
@@ -518,12 +524,14 @@ with tab_chat:
             reply = None
             try:
                 resp = requests.post(
-                    POLLINATIONS_TEXT_URL,
-                    json={"messages": messages_payload, "model": "openai", "jsonMode": False, "private": True, "stream": False},
+                    f"{POLLINATIONS_TEXT_URL}openai",
+                    json={"model": "openai", "messages": messages_payload},
+                    headers={"Content-Type": "application/json"},
                     timeout=20,
                 )
-                if resp.status_code == 200 and resp.text.strip():
-                    reply = resp.text.strip()
+                if resp.status_code == 200:
+                    data = resp.json()
+                    reply = data["choices"][0]["message"]["content"].strip()
             except Exception:
                 pass
             reply = reply or "The free text service timed out — try again in a moment."
