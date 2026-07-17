@@ -65,7 +65,7 @@ def pollinations_auth():
     return params, headers
 
 
-def call_pollinations_chat(messages, timeout=30):
+def call_pollinations_chat(messages, timeout=30, model="openai"):
     """
     Calls Pollinations' OpenAI-compatible chat endpoint (handles both plain text
     and vision messages). Tries the primary text.pollinations.ai/openai endpoint,
@@ -75,7 +75,7 @@ def call_pollinations_chat(messages, timeout=30):
     """
     extra_params, extra_headers = pollinations_auth()
     headers = {"Content-Type": "application/json", **extra_headers}
-    payload = {"model": "openai", "messages": messages}
+    payload = {"model": model, "messages": messages}
 
     last_error = None
     for base in (f"{POLLINATIONS_TEXT_URL}openai", "https://gen.pollinations.ai/openai"):
@@ -96,10 +96,13 @@ def call_pollinations_chat(messages, timeout=30):
 
 def describe_style_from_images(image_files):
     """
-    Sends up to 3 uploaded images to Pollinations' free vision model as base64
+    Sends up to 3 uploaded images to Pollinations' vision model as base64
     (no external hosting needed) and asks it to describe the visual art style
     in words. That description gets folded into every generation prompt, which
     is far more reliable than image-to-image conditioning on the free tier.
+    Note: this must use a vision-capable model (openai-large) — the default
+    "openai" model silently ignores image content and just answers as if no
+    image were attached.
     Returns (description, error_message).
     """
     content = [{
@@ -119,7 +122,7 @@ def describe_style_from_images(image_files):
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         })
-    return call_pollinations_chat([{"role": "user", "content": content}], timeout=40)
+    return call_pollinations_chat([{"role": "user", "content": content}], timeout=40, model="openai-large")
 
 
 # ---------------- Sidebar: style ----------------
@@ -530,30 +533,45 @@ with tab_scenes:
 # ---------------- TAB 3: Chat assistant ----------------
 with tab_chat:
     st.subheader("Script & prompt assistant")
-    st.caption("Free text chat via Pollinations — ask it to draft narration, suggest scene splits, or tweak stickman prompts. Attach an image for it to look at, too.")
+    st.caption("Free text chat via Pollinations — ask it to draft narration, suggest scene splits, or tweak stickman prompts. Attach up to 3 images for it to look at, too.")
 
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
-            if msg.get("image_preview"):
-                st.image(msg["image_preview"], width=200)
+            if msg.get("image_previews"):
+                cols = st.columns(len(msg["image_previews"]))
+                for c, img in zip(cols, msg["image_previews"]):
+                    with c:
+                        st.image(img, width=150)
             st.markdown(msg["content"])
 
-    chat_attachment = st.file_uploader(
-        "📎 Attach an image (optional)", type=["png", "jpg", "jpeg"], key="chat_image_uploader"
+    chat_attachments = st.file_uploader(
+        "📎 Attach up to 3 images (optional)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="chat_image_uploader",
     )
-    if chat_attachment:
-        st.image(chat_attachment, caption="Attached — will be sent with your next message", width=150)
+    if chat_attachments and len(chat_attachments) > 3:
+        st.warning("Only the first 3 images will be sent.")
+        chat_attachments = chat_attachments[:3]
+    if chat_attachments:
+        cols = st.columns(len(chat_attachments))
+        for c, f in zip(cols, chat_attachments):
+            with c:
+                st.image(f, caption="Attached", width=150)
 
     if user_msg := st.chat_input("e.g. 'Split this into 8 stickman scenes about the hedonic treadmill'"):
-        attached_bytes = chat_attachment.getvalue() if chat_attachment else None
-        attached_name = chat_attachment.name if chat_attachment else None
+        attached = [(f.name, f.getvalue()) for f in chat_attachments] if chat_attachments else []
+        preview_imgs = [b for _, b in attached]
 
         st.session_state.chat_messages.append({
-            "role": "user", "content": user_msg, "image_preview": attached_bytes
+            "role": "user", "content": user_msg, "image_previews": preview_imgs
         })
         with st.chat_message("user"):
-            if attached_bytes:
-                st.image(attached_bytes, width=200)
+            if preview_imgs:
+                cols = st.columns(len(preview_imgs))
+                for c, img in zip(cols, preview_imgs):
+                    with c:
+                        st.image(img, width=150)
             st.markdown(user_msg)
 
         with st.chat_message("assistant"):
@@ -562,8 +580,8 @@ with tab_chat:
             system_instruction = (
                 "You are an expert short-video producer. Write concise, engaging scripts with "
                 "clear timestamp brackets like [00:00 - 00:05], and suggest a matching minimalist "
-                "stickman visual for each line. If an image is attached, use it as context or "
-                "style inspiration as relevant to the request."
+                "stickman visual for each line. If images are attached, look at them closely and use "
+                "them as context or style inspiration as relevant to the request."
             )
             messages_payload = [{"role": "system", "content": system_instruction}]
 
@@ -571,21 +589,22 @@ with tab_chat:
             for m in st.session_state.chat_messages[-6:-1]:
                 messages_payload.append({"role": m["role"], "content": m["content"]})
 
-            # Current turn: attach the image inline if present
-            if attached_bytes:
-                mime = mimetypes.guess_type(attached_name or "image.jpg")[0] or "image/jpeg"
-                b64 = base64.b64encode(attached_bytes).decode()
-                messages_payload.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_msg},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                    ],
-                })
+            # Current turn: attach any images inline if present
+            if attached:
+                turn_content = [{"type": "text", "text": user_msg}]
+                for fname, fbytes in attached:
+                    mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
+                    b64 = base64.b64encode(fbytes).decode()
+                    turn_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                messages_payload.append({"role": "user", "content": turn_content})
+                # openai-large is the vision-capable model; the default "openai" model
+                # silently ignores image content and answers as if nothing were attached
+                model_to_use = "openai-large"
             else:
                 messages_payload.append({"role": "user", "content": user_msg})
+                model_to_use = "openai"
 
-            reply, err = call_pollinations_chat(messages_payload, timeout=40)
+            reply, err = call_pollinations_chat(messages_payload, timeout=40, model=model_to_use)
             reply = reply or f"The free text service didn't respond ({err}). Try again in a moment."
             placeholder.markdown(reply)
-            st.session_state.chat_messages.append({"role": "assistant", "content": reply, "image_preview": None})
+            st.session_state.chat_messages.append({"role": "assistant", "content": reply, "image_previews": []})
