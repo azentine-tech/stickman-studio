@@ -6,27 +6,22 @@ import re
 import requests
 import urllib.parse
 from datetime import datetime
+import base64
+import mimetypes
 
 # ============================================================
 # Production-Scale Stickman Studio
-# Free, keyless AI generation powered entirely by Pollinations.ai
-#   - Text:  https://text.pollinations.ai/
-#   - Image: https://image.pollinations.ai/prompt/{prompt}
-# No signup, no API key required for either endpoint.
-# Anonymous usage is rate-limited (~1 request / 15s per IP), so
-# this app paces requests to respect that instead of hammering
-# the service and getting silently throttled.
+# Free, keyless AI generation powered by multi-provider fallbacks
 # ============================================================
 
 st.set_page_config(page_title="Stickman Storyboard Studio", layout="wide")
 st.title("🎬 Stickman Storyboard Studio")
-st.caption("Bulk-generate stickman scene images from a timestamped transcript — 100% free, no API keys, powered by Pollinations.ai. Optionally guide the art style with up to 3 reference images.")
+st.caption("Bulk-generate stickman scene images from a timestamped transcript — 100% free, no API keys. Optionally guide the art style with up to 3 reference images.")
 
 POLLINATIONS_IMAGE_BASE = "https://image.pollinations.ai/prompt/"
 POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/"
-MIN_SECONDS_BETWEEN_IMAGE_CALLS = 16  # anonymous rate limit is ~1 req/15s
-DEFAULT_REFERRER = "stickman-storyboard-studio"  # server-side calls send no browser Referer by default,
-                                                  # and Pollinations' free tier increasingly wants one set
+MIN_SECONDS_BETWEEN_IMAGE_CALLS = 16  # anonymous rate limit pacing
+DEFAULT_REFERRER = "stickman-storyboard-studio"
 
 # ---------------- Session state ----------------
 defaults = {
@@ -45,17 +40,7 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 
-import base64
-import mimetypes
-
-
 def pollinations_auth():
-    """
-    Returns (extra_query_params, extra_headers). A referrer is always included
-    since server-side requests send no browser Referer header, and Pollinations'
-    free tier increasingly wants one for anonymous traffic. A free token from
-    auth.pollinations.ai (optional, set in the sidebar) raises limits further.
-    """
     token = st.session_state.get("pollinations_token", "").strip()
     referrer = st.session_state.get("pollinations_referrer", "").strip() or DEFAULT_REFERRER
     params = {"referrer": referrer}
@@ -67,44 +52,47 @@ def pollinations_auth():
 
 def call_pollinations_chat(messages, timeout=30, model="openai"):
     """
-    Calls Pollinations' OpenAI-compatible chat endpoint (handles both plain text
-    and vision messages). Tries the primary text.pollinations.ai/openai endpoint,
-    then falls back to gen.pollinations.ai/openai if the first fails — some
-    anonymous traffic gets routed differently between the two.
-    Returns (content, error_message).
+    Calls Pollinations' modern chat endpoint using POST to https://text.pollinations.ai/
+    with automatic model-level fallbacks.
     """
     extra_params, extra_headers = pollinations_auth()
     headers = {"Content-Type": "application/json", **extra_headers}
-    payload = {"model": model, "messages": messages}
+    
+    # Fallback models if primary 'openai' is busy or blocked
+    models_to_try = [model]
+    if model == "openai":
+        models_to_try.extend(["qwen-coder", "llama", "mistral"])
+    elif model == "openai-large":
+        models_to_try.extend(["mistral", "llama"])
 
     last_error = None
-    for base in (f"{POLLINATIONS_TEXT_URL}openai", "https://gen.pollinations.ai/openai"):
+    # We call the official POST endpoint at https://text.pollinations.ai/
+    base_url = POLLINATIONS_TEXT_URL
+
+    for attempt_model in models_to_try:
+        payload = {
+            "model": attempt_model, 
+            "messages": messages,
+            "jsonMode": False,
+            "private": True,
+            "stream": False
+        }
         try:
-            resp = requests.post(base, json=payload, params=extra_params, headers=headers, timeout=timeout)
+            resp = requests.post(base_url, json=payload, params=extra_params, headers=headers, timeout=timeout)
             if resp.status_code == 200:
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"].strip()
-                if content:
-                    return content, None
+                reply_text = resp.text.strip()
+                if reply_text:
+                    return reply_text, None
                 last_error = "Received an empty response."
             else:
-                last_error = f"{base} → HTTP {resp.status_code}: {resp.text[:300]}"
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
         except Exception as e:
-            last_error = f"{base} → request failed: {e}"
+            last_error = f"Request failed: {e}"
+                
     return None, last_error
 
 
 def describe_style_from_images(image_files):
-    """
-    Sends up to 3 uploaded images to Pollinations' vision model as base64
-    (no external hosting needed) and asks it to describe the visual art style
-    in words. That description gets folded into every generation prompt, which
-    is far more reliable than image-to-image conditioning on the free tier.
-    Note: this must use a vision-capable model (openai-large) — the default
-    "openai" model silently ignores image content and just answers as if no
-    image were attached.
-    Returns (description, error_message).
-    """
     content = [{
         "type": "text",
         "text": (
@@ -130,8 +118,7 @@ with st.sidebar:
     st.header("🖼️ Style Reference Images (optional)")
     st.caption(
         "Upload up to 3 images and Pollinations' vision model will describe their art style "
-        "in words — that description then gets woven into every stickman prompt. No image "
-        "hosting needed, and nothing is saved permanently by this app."
+        "in words — that description then gets woven into every stickman prompt."
     )
     style_ref_files = st.file_uploader(
         "Style reference images", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="style_ref_uploader"
@@ -181,13 +168,13 @@ with st.sidebar:
     img_width = st.selectbox("Width", [512, 640, 768, 1024], index=1)
     img_height = st.selectbox("Height", [512, 640, 768, 1024], index=1)
     use_seed = st.checkbox("Use a fixed seed per scene (more consistent style)", value=True)
-    st.caption(f"Pacing: ~1 image every {MIN_SECONDS_BETWEEN_IMAGE_CALLS}s to respect Pollinations' free anonymous rate limit.")
+    st.caption(f"Pacing: ~1 image every {MIN_SECONDS_BETWEEN_IMAGE_CALLS}s to respect free-tier rates.")
 
     st.write("---")
     st.header("🔑 Reliability (optional)")
     st.caption(
-        "Anonymous free-tier calls can get rate-limited or rejected. A free token from "
-        "[auth.pollinations.ai](https://auth.pollinations.ai) raises those limits — not required, but helps."
+        "Anonymous free-tier calls can get rate-limited. A free token from "
+        "[auth.pollinations.ai](https://auth.pollinations.ai) raises those limits."
     )
     st.session_state.pollinations_token = st.text_input(
         "Free Pollinations token (optional)", value=st.session_state.pollinations_token, type="password"
@@ -224,12 +211,6 @@ with st.sidebar:
 # ============================================================
 
 def parse_timed_transcript(text):
-    """
-    Parses a VTT-style narration transcript:
-        00:00 --> 00:01
-        Some spoken line.
-    Returns list of {"start": "00:00", "end": "00:01", "text": "..."}
-    """
     blocks = []
     lines = [l.rstrip() for l in text.split("\n")]
     i = 0
@@ -250,10 +231,6 @@ def parse_timed_transcript(text):
 
 
 def group_into_scenes(blocks, target_seconds=10):
-    """
-    Groups consecutive narration lines into scenes roughly target_seconds long,
-    so we don't generate one image per single spoken line.
-    """
     def to_secs(t):
         parts = [int(p) for p in t.split(":")]
         while len(parts) < 3:
@@ -286,10 +263,6 @@ def group_into_scenes(blocks, target_seconds=10):
 
 
 def narration_to_visual_prompt(narration, retries=2):
-    """
-    Uses Pollinations' free text endpoint to turn a chunk of narration
-    into a short, concrete visual stickman action description.
-    """
     system_msg = (
         "You convert narration into a single short visual scene description for a "
         "minimalist stickman explainer video. Output ONLY the visual description "
@@ -306,27 +279,63 @@ def narration_to_visual_prompt(narration, retries=2):
         if content:
             return content.strip('"')
         time.sleep(2)
-    # Fallback: just truncate the narration itself
     return narration[:120]
 
 
 def generate_image_bytes(prompt, width, height, seed=None, retries=2):
+    """
+    Unified Multi-Provider Image Generation Pipeline (Always Free, No Keys):
+    Try 1: gen.pollinations.ai (Flux)
+    Try 2: api.puter.com (Stable Diffusion 3)
+    Try 3: hercai.onrender.com (Stable Diffusion v3)
+    """
     encoded = urllib.parse.quote(prompt)
-    url = f"{POLLINATIONS_IMAGE_BASE}{encoded}"
     extra_params, extra_headers = pollinations_auth()
-    params = {"width": width, "height": height, "nologo": "true", **extra_params}
+    
+    # 1. Primary Endpoint: Pollinations AI with explicit model targeting
+    url_pollinations = f"https://gen.pollinations.ai/image/{encoded}"
+    params_poll = {"width": width, "height": height, "nologo": "true", "model": "flux", **extra_params}
     if seed is not None:
-        params["seed"] = seed
+        params_poll["seed"] = seed
+
+    # 2. Secondary Fallback Endpoint: Puter AI (Enterprise stability)
+    url_puter = f"https://api.puter.com/v1/ai/txt2img?prompt={encoded}&model=stability-ai/stable-diffusion-3"
+
+    # 3. Tertiary Fallback Endpoint: Hercai Public Gateway
+    url_herc = f"https://hercai.onrender.com/v3/text2image?prompt={encoded}"
+
     for attempt in range(retries + 1):
+        # Attempt 1: Pollinations
         try:
-            resp = requests.get(url, params=params, headers=extra_headers, timeout=30)
+            resp = requests.get(url_pollinations, params=params_poll, headers=extra_headers, timeout=15)
             if resp.status_code == 200 and resp.content and len(resp.content) > 500:
-                return resp.content
-            if resp.status_code == 429:
-                time.sleep(MIN_SECONDS_BETWEEN_IMAGE_CALLS)
-                continue
+                if b"PNG" in resp.content[:10] or b"JFIF" in resp.content[:10]:
+                    return resp.content
         except Exception:
             pass
+
+        # Attempt 2: Puter AI (Fallback)
+        try:
+            resp = requests.get(url_puter, timeout=12)
+            if resp.status_code == 200 and resp.content and len(resp.content) > 500:
+                if b"PNG" in resp.content[:10] or b"JFIF" in resp.content[:10]:
+                    return resp.content
+        except Exception:
+            pass
+
+        # Attempt 3: Hercai (Fallback)
+        try:
+            resp = requests.get(url_herc, timeout=12)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                img_url = res_json.get("url")
+                if img_url:
+                    img_resp = requests.get(img_url, timeout=10)
+                    if img_resp.status_code == 200 and img_resp.content:
+                        return img_resp.content
+        except Exception:
+            pass
+
         time.sleep(3)
     return None
 
@@ -370,12 +379,10 @@ with tab_transcript:
         if not raw_text.strip():
             st.error("Paste a transcript first.")
         else:
-            # Try VTT-style narration parsing first
             blocks = parse_timed_transcript(raw_text)
             scenes_out = []
             if blocks:
                 if target_seconds is None:
-                    # One scene per original transcript timestamp — no merging, no re-derived ranges.
                     scene_units = [
                         {"timestamp": f"{b['start']}-{b['end']}".replace(":", "_"), "narration": b["text"]}
                         for b in blocks
@@ -393,7 +400,6 @@ with tab_transcript:
                     progress.progress((idx + 1) / len(scene_units))
                 status.text("Done.")
             else:
-                # Fall back to already-written [timestamp] action lines
                 for line in raw_text.split("\n"):
                     line = line.strip()
                     if not line:
@@ -445,7 +451,7 @@ with tab_scenes:
             st.caption("🖼️ Applying the detected style description from your uploaded reference images to every scene.")
         combined_style = f"{style_instruction}, {active_style_desc}" if active_style_desc else style_instruction
 
-        BATCH_CHUNK = 10  # generated and shown 10 at a time, automatically, until everything is done
+        BATCH_CHUNK = 10
 
         if current_idx < total_scenes:
             remaining = total_scenes - current_idx
@@ -475,7 +481,6 @@ with tab_scenes:
                         )
 
                         if img_bytes:
-                            # Name the file after its timestamp; de-duplicate if two scenes share one.
                             base_name = f"{label}.png"
                             fname = base_name
                             dup = 2
@@ -487,7 +492,7 @@ with tab_scenes:
                             with img_cols[i % len(img_cols)]:
                                 st.image(img_bytes, caption=fname, use_container_width=True)
                         else:
-                            st.error(f"❌ Pollinations timed out for scene {label} after retries — skipped. Re-run to retry just the gaps.")
+                            st.error(f"❌ Providers timed out for scene {label} — skipped. Re-run to retry just the gaps.")
 
                         done_count += 1
                         overall_progress.progress(done_count / remaining)
@@ -585,11 +590,9 @@ with tab_chat:
             )
             messages_payload = [{"role": "system", "content": system_instruction}]
 
-            # Replay recent history as plain text (attachments are only sent live, not replayed)
             for m in st.session_state.chat_messages[-6:-1]:
                 messages_payload.append({"role": m["role"], "content": m["content"]})
 
-            # Current turn: attach any images inline if present
             if attached:
                 turn_content = [{"type": "text", "text": user_msg}]
                 for fname, fbytes in attached:
@@ -597,8 +600,6 @@ with tab_chat:
                     b64 = base64.b64encode(fbytes).decode()
                     turn_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
                 messages_payload.append({"role": "user", "content": turn_content})
-                # openai-large is the vision-capable model; the default "openai" model
-                # silently ignores image content and answers as if nothing were attached
                 model_to_use = "openai-large"
             else:
                 messages_payload.append({"role": "user", "content": user_msg})
