@@ -53,20 +53,19 @@ def pollinations_auth():
 def call_pollinations_chat(messages, timeout=30, model="openai"):
     """
     Calls Pollinations' modern chat endpoint using POST to https://text.pollinations.ai/
-    with automatic model-level fallbacks.
+    with updated, non-deprecated model fallback paths.
     """
     extra_params, extra_headers = pollinations_auth()
     headers = {"Content-Type": "application/json", **extra_headers}
     
-    # Fallback models if primary 'openai' is busy or blocked
+    # Fallback paths utilizing only active, non-deprecated model tags
     models_to_try = [model]
     if model == "openai":
-        models_to_try.extend(["qwen-coder", "llama", "mistral"])
+        models_to_try.extend(["qwen-coder", "llama-3.1-8b", "mistral-large"])
     elif model == "openai-large":
-        models_to_try.extend(["mistral", "llama"])
+        models_to_try.extend(["mistral-large", "llama-3.1-8b"])
 
     last_error = None
-    # We call the official POST endpoint at https://text.pollinations.ai/
     base_url = POLLINATIONS_TEXT_URL
 
     for attempt_model in models_to_try:
@@ -85,7 +84,7 @@ def call_pollinations_chat(messages, timeout=30, model="openai"):
                     return reply_text, None
                 last_error = "Received an empty response."
             else:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                last_error = f"HTTP {resp.status_code} ({attempt_model}): {resp.text[:200]}"
         except Exception as e:
             last_error = f"Request failed: {e}"
                 
