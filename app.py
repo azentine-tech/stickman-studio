@@ -33,41 +33,71 @@ defaults = {
     "current_index": 0,
     "chat_messages": [],
     "raw_transcript_text": "",
-    "style_ref_urls": [],        # public URLs of uploaded style reference images
-    "style_ref_uploaded_names": [],  # names of files already uploaded, to avoid re-uploading
+    "style_ref_description": "",     # text description of uploaded reference images' style
+    "style_ref_uploaded_names": [],  # names of files already analyzed, to avoid re-analyzing
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-def upload_to_catbox(image_bytes, filename):
+import base64
+import mimetypes
+
+
+def describe_style_from_images(image_files):
     """
-    Uploads an image to catbox.moe (free, anonymous, no API key) and returns
-    a public URL, or None on failure. Pollinations' image-to-image models
-    require a public URL for reference images, not raw bytes.
+    Sends up to 3 uploaded images to Pollinations' free vision model as base64
+    (no external hosting needed) and asks it to describe the visual art style
+    in words. That description gets folded into every generation prompt, which
+    is far more reliable than image-to-image conditioning on the free tier.
+    Returns (description, error_message).
     """
+    content = [{
+        "type": "text",
+        "text": (
+            "These images are style references for a minimalist stickman explainer-video "
+            "illustration. Describe ONLY the visual style in 2-3 sentences: line weight, "
+            "color palette, shading, composition, and mood. Do not describe the subject "
+            "matter or people in the images, only the drawing/art style itself. Output just "
+            "the description, no preamble."
+        ),
+    }]
+    for f in image_files:
+        mime = mimetypes.guess_type(f.name)[0] or "image/jpeg"
+        b64 = base64.b64encode(f.getvalue()).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+
+    payload = {
+        "model": "openai",
+        "messages": [{"role": "user", "content": content}],
+        "jsonMode": False,
+        "private": True,
+        "stream": False,
+    }
     try:
-        resp = requests.post(
-            "https://catbox.moe/user/api.php",
-            data={"reqtype": "fileupload"},
-            files={"fileToUpload": (filename, image_bytes)},
-            timeout=30,
-        )
-        if resp.status_code == 200 and resp.text.strip().startswith("http"):
-            return resp.text.strip()
-    except Exception:
-        pass
-    return None
+        resp = requests.post(f"{POLLINATIONS_TEXT_URL}openai", json=payload, timeout=40)
+        if resp.status_code == 200:
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"].strip()
+            if text:
+                return text, None
+            return None, "Vision model returned an empty description."
+        return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return None, f"Request failed: {e}"
 
 
 # ---------------- Sidebar: style ----------------
 with st.sidebar:
     st.header("🖼️ Style Reference Images (optional)")
     st.caption(
-        "Upload up to 3 images to guide the stickman art style. They're hosted anonymously on "
-        "catbox.moe (a free, no-signup file host) so Pollinations' image-to-image model can use them "
-        "as a reference — nothing is saved permanently in this app."
+        "Upload up to 3 images and Pollinations' vision model will describe their art style "
+        "in words — that description then gets woven into every stickman prompt. No image "
+        "hosting needed, and nothing is saved permanently by this app."
     )
     style_ref_files = st.file_uploader(
         "Style reference images", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="style_ref_uploader"
@@ -79,15 +109,13 @@ with st.sidebar:
     if style_ref_files:
         new_names = [f.name for f in style_ref_files]
         if new_names != st.session_state.style_ref_uploaded_names:
-            uploaded_urls = []
-            with st.spinner("Uploading style references..."):
-                for f in style_ref_files:
-                    url = upload_to_catbox(f.getvalue(), f.name)
-                    if url:
-                        uploaded_urls.append(url)
-                    else:
-                        st.error(f"Couldn't upload {f.name} — it will be skipped as a reference.")
-            st.session_state.style_ref_urls = uploaded_urls
+            with st.spinner("Analyzing style of uploaded images..."):
+                description, err = describe_style_from_images(style_ref_files)
+            if description:
+                st.session_state.style_ref_description = description
+            else:
+                st.error(f"Couldn't analyze the images: {err}")
+                st.session_state.style_ref_description = ""
             st.session_state.style_ref_uploaded_names = new_names
 
         cols = st.columns(len(style_ref_files))
@@ -95,13 +123,15 @@ with st.sidebar:
             with cols[idx]:
                 st.image(f, caption=f"Ref {idx+1}", use_container_width=True)
 
-        if st.session_state.style_ref_urls:
-            st.success(f"{len(st.session_state.style_ref_urls)} reference image(s) ready to use.")
-            use_style_refs = st.checkbox("Use these as style reference for generation", value=True)
+        if st.session_state.style_ref_description:
+            st.session_state.style_ref_description = st.text_area(
+                "Detected style (feel free to edit)", value=st.session_state.style_ref_description, height=90
+            )
+            use_style_refs = st.checkbox("Apply this style description to generation", value=True)
         else:
             use_style_refs = False
     else:
-        st.session_state.style_ref_urls = []
+        st.session_state.style_ref_description = ""
         st.session_state.style_ref_uploaded_names = []
         use_style_refs = False
 
@@ -242,20 +272,15 @@ def narration_to_visual_prompt(narration, retries=2):
     return narration[:120]
 
 
-def generate_image_bytes(prompt, width, height, seed=None, reference_urls=None, retries=2):
+def generate_image_bytes(prompt, width, height, seed=None, retries=2):
     encoded = urllib.parse.quote(prompt)
     url = f"{POLLINATIONS_IMAGE_BASE}{encoded}"
     params = {"width": width, "height": height, "nologo": "true"}
     if seed is not None:
         params["seed"] = seed
-    if reference_urls:
-        # nanobanana accepts multiple comma-separated reference images (safe up to ~4);
-        # kontext would only use the first, so nanobanana is used when refs are present.
-        params["model"] = "nanobanana"
-        params["image"] = ",".join(reference_urls)
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=45)
+            resp = requests.get(url, params=params, timeout=30)
             if resp.status_code == 200 and resp.content and len(resp.content) > 500:
                 return resp.content
             if resp.status_code == 429:
@@ -376,9 +401,10 @@ with tab_scenes:
         with st.expander("💡 Backup your scene list (copy/paste text)"):
             st.text_area("Backup", value=backup_text, height=100)
 
-        active_refs = st.session_state.style_ref_urls if use_style_refs else []
-        if active_refs:
-            st.caption(f"🖼️ Using {len(active_refs)} uploaded image(s) as style reference for every scene.")
+        active_style_desc = st.session_state.style_ref_description if use_style_refs else ""
+        if active_style_desc:
+            st.caption("🖼️ Applying the detected style description from your uploaded reference images to every scene.")
+        combined_style = f"{style_instruction}, {active_style_desc}" if active_style_desc else style_instruction
 
         BATCH_CHUNK = 10  # generated and shown 10 at a time, automatically, until everything is done
 
@@ -400,13 +426,13 @@ with tab_scenes:
                     for i, scene in enumerate(chunk):
                         label = scene["timestamp"]
                         action = scene["action"]
-                        full_prompt = f"{action}, {style_instruction}"
+                        full_prompt = f"{action}, {combined_style}"
                         global_i = current_idx + chunk_start + i
                         seed_val = global_i if use_seed else None
 
                         overall_status.text(f"Generating {done_count + 1}/{remaining} — {label}")
                         img_bytes = generate_image_bytes(
-                            full_prompt, img_width, img_height, seed=seed_val, reference_urls=active_refs
+                            full_prompt, img_width, img_height, seed=seed_val
                         )
 
                         if img_bytes:
