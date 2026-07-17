@@ -20,7 +20,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="Stickman Storyboard Studio", layout="wide")
 st.title("🎬 Stickman Storyboard Studio")
-st.caption("Bulk-generate stickman scene images from a timestamped transcript — 100% free, no API keys, powered by Pollinations.ai")
+st.caption("Bulk-generate stickman scene images from a timestamped transcript — 100% free, no API keys, powered by Pollinations.ai. Optionally guide the art style with up to 3 reference images.")
 
 POLLINATIONS_IMAGE_BASE = "https://image.pollinations.ai/prompt/"
 POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/"
@@ -33,13 +33,79 @@ defaults = {
     "current_index": 0,
     "chat_messages": [],
     "raw_transcript_text": "",
+    "style_ref_urls": [],        # public URLs of uploaded style reference images
+    "style_ref_uploaded_names": [],  # names of files already uploaded, to avoid re-uploading
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+
+def upload_to_catbox(image_bytes, filename):
+    """
+    Uploads an image to catbox.moe (free, anonymous, no API key) and returns
+    a public URL, or None on failure. Pollinations' image-to-image models
+    require a public URL for reference images, not raw bytes.
+    """
+    try:
+        resp = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (filename, image_bytes)},
+            timeout=30,
+        )
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            return resp.text.strip()
+    except Exception:
+        pass
+    return None
+
+
 # ---------------- Sidebar: style ----------------
 with st.sidebar:
+    st.header("🖼️ Style Reference Images (optional)")
+    st.caption(
+        "Upload up to 3 images to guide the stickman art style. They're hosted anonymously on "
+        "catbox.moe (a free, no-signup file host) so Pollinations' image-to-image model can use them "
+        "as a reference — nothing is saved permanently in this app."
+    )
+    style_ref_files = st.file_uploader(
+        "Style reference images", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="style_ref_uploader"
+    )
+    if style_ref_files and len(style_ref_files) > 3:
+        st.warning("Only the first 3 images will be used.")
+        style_ref_files = style_ref_files[:3]
+
+    if style_ref_files:
+        new_names = [f.name for f in style_ref_files]
+        if new_names != st.session_state.style_ref_uploaded_names:
+            uploaded_urls = []
+            with st.spinner("Uploading style references..."):
+                for f in style_ref_files:
+                    url = upload_to_catbox(f.getvalue(), f.name)
+                    if url:
+                        uploaded_urls.append(url)
+                    else:
+                        st.error(f"Couldn't upload {f.name} — it will be skipped as a reference.")
+            st.session_state.style_ref_urls = uploaded_urls
+            st.session_state.style_ref_uploaded_names = new_names
+
+        cols = st.columns(len(style_ref_files))
+        for idx, f in enumerate(style_ref_files):
+            with cols[idx]:
+                st.image(f, caption=f"Ref {idx+1}", use_container_width=True)
+
+        if st.session_state.style_ref_urls:
+            st.success(f"{len(st.session_state.style_ref_urls)} reference image(s) ready to use.")
+            use_style_refs = st.checkbox("Use these as style reference for generation", value=True)
+        else:
+            use_style_refs = False
+    else:
+        st.session_state.style_ref_urls = []
+        st.session_state.style_ref_uploaded_names = []
+        use_style_refs = False
+
+    st.write("---")
     st.header("🎨 Visual Style")
     default_style = (
         "minimalist hand-drawn stickman, clean solid black line art, "
@@ -176,15 +242,20 @@ def narration_to_visual_prompt(narration, retries=2):
     return narration[:120]
 
 
-def generate_image_bytes(prompt, width, height, seed=None, retries=2):
+def generate_image_bytes(prompt, width, height, seed=None, reference_urls=None, retries=2):
     encoded = urllib.parse.quote(prompt)
     url = f"{POLLINATIONS_IMAGE_BASE}{encoded}"
     params = {"width": width, "height": height, "nologo": "true"}
     if seed is not None:
         params["seed"] = seed
+    if reference_urls:
+        # nanobanana accepts multiple comma-separated reference images (safe up to ~4);
+        # kontext would only use the first, so nanobanana is used when refs are present.
+        params["model"] = "nanobanana"
+        params["image"] = ",".join(reference_urls)
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=30)
+            resp = requests.get(url, params=params, timeout=45)
             if resp.status_code == 200 and resp.content and len(resp.content) > 500:
                 return resp.content
             if resp.status_code == 429:
@@ -218,13 +289,18 @@ with tab_transcript:
     )
     st.session_state.raw_transcript_text = raw_text
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        target_seconds = st.slider("Group narration into scenes of about how many seconds?", 5, 30, 10)
-    with col_b:
-        st.write("")
-        st.write("")
-        convert_clicked = st.button("🪄 Convert transcript → stickman scenes", type="primary")
+    granularity = st.radio(
+        "Scene boundaries",
+        ["Match each timestamp line exactly (recommended)", "Merge nearby lines into ~N-second scenes"],
+        index=0,
+        help="Exact mode makes one image per timestamp in your transcript — the safest way to keep images "
+             "in sync with the actual video timing. Merge mode combines short lines into fewer, longer scenes.",
+    )
+    target_seconds = None
+    if granularity.startswith("Merge"):
+        target_seconds = st.slider("Target scene length (seconds)", 3, 30, 8)
+
+    convert_clicked = st.button("🪄 Convert transcript → stickman scenes", type="primary")
 
     if convert_clicked:
         if not raw_text.strip():
@@ -234,14 +310,23 @@ with tab_transcript:
             blocks = parse_timed_transcript(raw_text)
             scenes_out = []
             if blocks:
-                grouped = group_into_scenes(blocks, target_seconds=target_seconds)
+                if target_seconds is None:
+                    # One scene per original transcript timestamp — no merging, no re-derived ranges.
+                    scene_units = [
+                        {"timestamp": f"{b['start']}-{b['end']}".replace(":", "_"), "narration": b["text"]}
+                        for b in blocks
+                        if b["text"].strip()
+                    ]
+                else:
+                    scene_units = group_into_scenes(blocks, target_seconds=target_seconds)
+
                 progress = st.progress(0)
                 status = st.empty()
-                for idx, sc in enumerate(grouped):
-                    status.text(f"Converting scene {idx+1}/{len(grouped)} to a visual prompt...")
+                for idx, sc in enumerate(scene_units):
+                    status.text(f"Converting scene {idx+1}/{len(scene_units)} to a visual prompt ({sc['timestamp']})...")
                     visual = narration_to_visual_prompt(sc["narration"])
                     scenes_out.append({"timestamp": sc["timestamp"], "action": visual})
-                    progress.progress((idx + 1) / len(grouped))
+                    progress.progress((idx + 1) / len(scene_units))
                 status.text("Done.")
             else:
                 # Fall back to already-written [timestamp] action lines
@@ -258,7 +343,16 @@ with tab_transcript:
             if scenes_out:
                 st.session_state.all_scenes = scenes_out
                 st.session_state.current_index = 0
-                st.success(f"Created {len(scenes_out)} scenes. Head to tab 2 to generate images.")
+                est_minutes = round(len(scenes_out) * MIN_SECONDS_BETWEEN_IMAGE_CALLS / 60, 1)
+                st.success(
+                    f"Created {len(scenes_out)} scenes. Head to tab 2 to generate images "
+                    f"(roughly {est_minutes} min for all of them, due to the free-tier rate limit)."
+                )
+                if target_seconds is None and len(scenes_out) > 40:
+                    st.info(
+                        "Your transcript has a lot of very short timestamp lines, so this made a lot of scenes. "
+                        "If that's more images than you want, switch to 'Merge nearby lines' above and re-convert."
+                    )
             else:
                 st.error("Couldn't parse any scenes from that text — check the format.")
 
@@ -282,42 +376,63 @@ with tab_scenes:
         with st.expander("💡 Backup your scene list (copy/paste text)"):
             st.text_area("Backup", value=backup_text, height=100)
 
-        batch_size_choice = st.number_input(
-            "Batch size (images per click)", min_value=1, max_value=50, value=10, step=1
-        )
-        end_idx = min(current_idx + batch_size_choice, total_scenes)
+        active_refs = st.session_state.style_ref_urls if use_style_refs else []
+        if active_refs:
+            st.caption(f"🖼️ Using {len(active_refs)} uploaded image(s) as style reference for every scene.")
+
+        BATCH_CHUNK = 10  # generated and shown 10 at a time, automatically, until everything is done
 
         if current_idx < total_scenes:
-            if st.button(f"🚀 Generate scenes {current_idx + 1}–{end_idx} of {total_scenes}"):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                batch = st.session_state.all_scenes[current_idx:end_idx]
-                img_cols = st.columns(min(4, len(batch)))
+            remaining = total_scenes - current_idx
+            if st.button(f"🚀 Generate all {remaining} remaining images (in batches of {BATCH_CHUNK})", type="primary"):
+                overall_progress = st.progress(0)
+                overall_status = st.empty()
+                used_names = set(st.session_state.generated_files.keys())
 
-                for i, scene in enumerate(batch):
-                    label = scene["timestamp"]
-                    action = scene["action"]
-                    full_prompt = f"{action}, {style_instruction}"
-                    seed_val = (current_idx + i) if use_seed else None
+                scenes_to_run = st.session_state.all_scenes[current_idx:]
+                done_count = 0
 
-                    status_text.text(f"Generating {i+1}/{len(batch)}  —  {label}")
-                    img_bytes = generate_image_bytes(full_prompt, img_width, img_height, seed=seed_val)
+                for chunk_start in range(0, len(scenes_to_run), BATCH_CHUNK):
+                    chunk = scenes_to_run[chunk_start:chunk_start + BATCH_CHUNK]
+                    st.write(f"#### Batch: scenes {current_idx + chunk_start + 1}–{current_idx + chunk_start + len(chunk)} of {total_scenes}")
+                    img_cols = st.columns(min(5, len(chunk)))
 
-                    if img_bytes:
-                        fname = f"{label}_scene_{current_idx + i + 1}.png"
-                        st.session_state.generated_files[fname] = img_bytes
-                        with img_cols[i % len(img_cols)]:
-                            st.image(img_bytes, caption=fname, use_container_width=True)
-                    else:
-                        st.error(f"❌ Pollinations timed out for scene {label} after retries. It will be skipped — you can re-run this batch to retry just the failures.")
+                    for i, scene in enumerate(chunk):
+                        label = scene["timestamp"]
+                        action = scene["action"]
+                        full_prompt = f"{action}, {style_instruction}"
+                        global_i = current_idx + chunk_start + i
+                        seed_val = global_i if use_seed else None
 
-                    progress_bar.progress((i + 1) / len(batch))
-                    # Respect free-tier anonymous rate limit between requests
-                    if i < len(batch) - 1:
-                        time.sleep(MIN_SECONDS_BETWEEN_IMAGE_CALLS)
+                        overall_status.text(f"Generating {done_count + 1}/{remaining} — {label}")
+                        img_bytes = generate_image_bytes(
+                            full_prompt, img_width, img_height, seed=seed_val, reference_urls=active_refs
+                        )
 
-                st.session_state.current_index = end_idx
-                st.success("Batch complete!")
+                        if img_bytes:
+                            # Name the file after its timestamp; de-duplicate if two scenes share one.
+                            base_name = f"{label}.png"
+                            fname = base_name
+                            dup = 2
+                            while fname in used_names:
+                                fname = f"{label}_{dup}.png"
+                                dup += 1
+                            used_names.add(fname)
+                            st.session_state.generated_files[fname] = img_bytes
+                            with img_cols[i % len(img_cols)]:
+                                st.image(img_bytes, caption=fname, use_container_width=True)
+                        else:
+                            st.error(f"❌ Pollinations timed out for scene {label} after retries — skipped. Re-run to retry just the gaps.")
+
+                        done_count += 1
+                        overall_progress.progress(done_count / remaining)
+                        st.session_state.current_index = current_idx + chunk_start + i + 1
+
+                        if done_count < remaining:
+                            time.sleep(MIN_SECONDS_BETWEEN_IMAGE_CALLS)
+
+                overall_status.text("Done.")
+                st.success(f"Generated {done_count} images.")
                 st.rerun()
         else:
             st.balloons()
@@ -326,7 +441,7 @@ with tab_scenes:
     if st.session_state.generated_files:
         st.write("---")
         st.subheader("📥 Download all images")
-        st.write(f"Images stored: **{len(st.session_state.generated_files)}**")
+        st.write(f"Images stored: **{len(st.session_state.generated_files)}**, each named after its timestamp, all in one flat ZIP folder.")
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
