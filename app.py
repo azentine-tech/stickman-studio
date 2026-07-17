@@ -1,5 +1,4 @@
 import streamlit as st
-import base64
 import time
 import io
 import zipfile
@@ -8,271 +7,384 @@ import requests
 import urllib.parse
 from datetime import datetime
 
-# Page styling
-st.set_page_config(page_title="Production Scale Stickman Studio", layout="wide")
-st.title("🎬 Resilient Production-Scale Stickman Studio")
-st.write("100% Free & Unlimited: High-speed Cloudflare Chat & Enterprise-Grade Puter.js Visual Engine.")
+# ============================================================
+# Production-Scale Stickman Studio
+# Free, keyless AI generation powered entirely by Pollinations.ai
+#   - Text:  https://text.pollinations.ai/
+#   - Image: https://image.pollinations.ai/prompt/{prompt}
+# No signup, no API key required for either endpoint.
+# Anonymous usage is rate-limited (~1 request / 15s per IP), so
+# this app paces requests to respect that instead of hammering
+# the service and getting silently throttled.
+# ============================================================
 
-# Sidebar for Setup & Styling Guardrails
+st.set_page_config(page_title="Stickman Storyboard Studio", layout="wide")
+st.title("🎬 Stickman Storyboard Studio")
+st.caption("Bulk-generate stickman scene images from a timestamped transcript — 100% free, no API keys, powered by Pollinations.ai")
+
+POLLINATIONS_IMAGE_BASE = "https://image.pollinations.ai/prompt/"
+POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/"
+MIN_SECONDS_BETWEEN_IMAGE_CALLS = 16  # anonymous rate limit is ~1 req/15s
+
+# ---------------- Session state ----------------
+defaults = {
+    "all_scenes": [],           # list of {"timestamp": str, "action": str}
+    "generated_files": {},       # filename -> bytes
+    "current_index": 0,
+    "chat_messages": [],
+    "raw_transcript_text": "",
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ---------------- Sidebar: style ----------------
 with st.sidebar:
-    st.header("🎨 1. Visual Style Reference Uploader")
-    uploaded_files = st.file_uploader(
-        "Upload up to 3 stickman style examples", 
-        type=["png", "jpg", "jpeg"], 
-        accept_multiple_files=True
+    st.header("🎨 Visual Style")
+    default_style = (
+        "minimalist hand-drawn stickman, clean solid black line art, "
+        "webcomic explainer-doodle style, solid pure white background, no text, no watermark"
     )
-    
-    if len(uploaded_files) > 3:
-        st.warning("Only the first 3 images will be used for style reference.")
-        uploaded_files = uploaded_files[:3]
+    style_instruction = st.text_area("Style guidance appended to every prompt", value=default_style, height=100)
 
-    st.header("📝 2. Global Styling Output")
-    style_instruction_box = st.empty()
-    default_style = "A minimalist hand-drawn stickman, clean solid black line art, webcomic / explainer doodle style, solid pure white background."
-    style_instruction = style_instruction_box.text_area("Calculated Style Guidance", value=default_style)
+    st.header("⚙️ Generation Settings")
+    img_width = st.selectbox("Width", [512, 640, 768, 1024], index=1)
+    img_height = st.selectbox("Height", [512, 640, 768, 1024], index=1)
+    use_seed = st.checkbox("Use a fixed seed per scene (more consistent style)", value=True)
+    st.caption(f"Pacing: ~1 image every {MIN_SECONDS_BETWEEN_IMAGE_CALLS}s to respect Pollinations' free anonymous rate limit.")
 
-# --- IN-MEMORY SESSION PERSISTENCE ---
-if "all_scenes" not in st.session_state:
-    st.session_state.all_scenes = []
-if "generated_files" not in st.session_state:
-    st.session_state.generated_files = {}
-if "current_index" not in st.session_state:
-    st.session_state.current_index = 0
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# --- RECOVERY RE-LOADER ---
-st.sidebar.write("---")
-st.sidebar.header("💾 3. Session Recovery Center")
-st.sidebar.write("If you refreshed the page, paste your backup data below to recover your work instantly.")
-recovery_data = st.sidebar.text_area("Paste Raw Backup Data Here", placeholder="Paste backup text...")
-if st.sidebar.button("Retrieve Work"):
-    if recovery_data:
-        try:
-            restored_scenes = []
-            lines = recovery_data.split("\n")
-            for line in lines:
-                if line.strip():
-                    match = re.match(r"^\[(.*?)\]\s*(.*)$", line.strip())
-                    if match:
-                        timestamp = match.group(1).replace(":", "_").replace(" ", "")
-                        action = match.group(2).strip()
-                        restored_scenes.append({"timestamp": timestamp, "action": action})
-            st.session_state.all_scenes = restored_scenes
+    st.write("---")
+    st.header("💾 Session Recovery")
+    st.caption("Paste a backup below to restore scenes after a refresh.")
+    recovery_data = st.text_area("Backup data", placeholder="[timestamp] action ...", key="recovery_box")
+    if st.button("Restore scenes from backup"):
+        restored = []
+        for line in recovery_data.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r"^\[(.*?)\]\s*(.*)$", line)
+            if m:
+                restored.append({"timestamp": m.group(1), "action": m.group(2).strip()})
+        if restored:
+            st.session_state.all_scenes = restored
             st.session_state.current_index = 0
-            st.sidebar.success(f"Successfully recovered {len(restored_scenes)} scenes!")
+            st.success(f"Restored {len(restored)} scenes.")
             st.rerun()
-        except Exception as err:
-            st.sidebar.error(f"Failed to parse recovery text: {err}")
-
-# Layout Columns
-col_chat, col_gen = st.columns([1, 1])
-
-# --- LEFT COLUMN: 100% FREE CLOUDFLARE CHAT ASSISTANT ---
-with col_chat:
-    st.subheader("💬 Script Researcher & Voiceover Producer")
-    st.caption("Powered by Cloudflare Llama-3-8B Edge — Highly Stable, No API Key Required!")
-    
-    if uploaded_files:
-        cols = st.columns(len(uploaded_files))
-        for idx, uf in enumerate(uploaded_files):
-            with cols[idx]:
-                st.image(uf, caption=f"Style Ref {idx+1}", use_container_width=True)
-                
-    chat_container = st.container(height=400)
-    with chat_container:
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-
-    if chat_input := st.chat_input("E.g., 'Write a 30-sec transcript with stickman prompts about bees making honey.'"):
-        with chat_container:
-            with st.chat_message("user"):
-                st.markdown(chat_input)
-        st.session_state.messages.append({"role": "user", "content": chat_input})
-        
-        with chat_container:
-            with st.chat_message("assistant"):
-                response_placeholder = st.empty()
-                response_placeholder.markdown("🧠 *Generating response...*")
-                
-                system_instruction = (
-                    "You are an expert AI Video Producer. Your job is to:\n"
-                    "1. Write highly engaging, short scripts with clear timing brackets like [00:00 - 00:05].\n"
-                    "2. Translate each scene action into highly descriptive, minimalist cartoon stickman prompts.\n"
-                    "Avoid any mention of keys or technical constraints to the user."
-                )
-
-                # Format payload with system context and recent history
-                messages_payload = [{"role": "system", "content": system_instruction}]
-                for msg in st.session_state.messages[-6:]:
-                    messages_payload.append({"role": msg["role"], "content": msg["content"]})
-                
-                reply_text = None
-                
-                # Cloudflare serverless edge pipeline
-                try:
-                    url = "https://text.pollinations.ai/"
-                    payload = {
-                        "messages": messages_payload,
-                        "model": "llama",  # Routes cleanly through the ultra-stable Llama-3 pipeline
-                        "jsonMode": False,
-                        "private": True,
-                        "stream": False
-                    }
-                    response = requests.post(url, json=payload, timeout=15)
-                    if response.status_code == 200 and response.text.strip():
-                        reply_text = response.text.strip()
-                except Exception as e:
-                    pass
-                
-                if not reply_text:
-                    reply_text = "Server request timed out. Please try resubmitting your prompt in a moment!"
-                
-                response_placeholder.markdown(reply_text)
-                st.session_state.messages.append({"role": "assistant", "content": reply_text})
-
-# --- RIGHT COLUMN: TRANSCRIPT SAVER & BATCHED GENERATION ---
-with col_gen:
-    st.subheader("📝 Transcript To Batched Images")
-    st.caption("Paste transcript below. Powered by enterprise-grade Puter.js Stable Diffusion 3 fallback networks.")
-    
-    transcript_input = st.text_area(
-        "Paste Complete Timestamps & Actions Here",
-        placeholder="[00:00 - 00:05] Stickman running on a road\n[00:05 - 00:10] Stickman jumping over hurdles...",
-        height=150
-    )
-    
-    if st.button("💾 Save Transcript"):
-        if transcript_input.strip():
-            parsed_scenes = []
-            lines = transcript_input.split("\n")
-            for line in lines:
-                if line.strip():
-                    match = re.match(r"^\[(.*?)\]\s*(.*)$", line.strip())
-                    if match:
-                        timestamp = match.group(1).replace(":", "_").replace(" ", "")
-                        action = match.group(2).strip()
-                        parsed_scenes.append({"timestamp": timestamp, "action": action})
-                    else:
-                        fallback_time = datetime.now().strftime("%H%M%S")
-                        parsed_scenes.append({"timestamp": f"scene_{fallback_time}", "action": line.strip()})
-            
-            st.session_state.all_scenes = parsed_scenes
-            st.session_state.current_index = 0  
-            st.success(f"Transcript Saved! Parsed **{len(parsed_scenes)}** scenes. Ready to generate.")
         else:
-            st.error("Transcript cannot be empty.")
+            st.error("Couldn't parse any scenes from that text.")
 
-    # Status Monitor
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+def parse_timed_transcript(text):
+    """
+    Parses a VTT-style narration transcript:
+        00:00 --> 00:01
+        Some spoken line.
+    Returns list of {"start": "00:00", "end": "00:01", "text": "..."}
+    """
+    blocks = []
+    lines = [l.rstrip() for l in text.split("\n")]
+    i = 0
+    time_re = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?)\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?)")
+    while i < len(lines):
+        m = time_re.match(lines[i].strip())
+        if m:
+            start, end = m.group(1), m.group(2)
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip() and not time_re.match(lines[i].strip()):
+                text_lines.append(lines[i].strip())
+                i += 1
+            blocks.append({"start": start, "end": end, "text": " ".join(text_lines)})
+        else:
+            i += 1
+    return blocks
+
+
+def group_into_scenes(blocks, target_seconds=10):
+    """
+    Groups consecutive narration lines into scenes roughly target_seconds long,
+    so we don't generate one image per single spoken line.
+    """
+    def to_secs(t):
+        parts = [int(p) for p in t.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        h, m, s = parts
+        return h * 3600 + m * 60 + s
+
+    scenes = []
+    current_text = []
+    scene_start = None
+    scene_end = None
+    for b in blocks:
+        if scene_start is None:
+            scene_start = b["start"]
+        scene_end = b["end"]
+        current_text.append(b["text"])
+        if to_secs(scene_end) - to_secs(scene_start) >= target_seconds:
+            scenes.append({
+                "timestamp": f"{scene_start}-{scene_end}".replace(":", "_"),
+                "narration": " ".join(current_text),
+            })
+            current_text = []
+            scene_start = None
+    if current_text:
+        scenes.append({
+            "timestamp": f"{scene_start}-{scene_end}".replace(":", "_"),
+            "narration": " ".join(current_text),
+        })
+    return scenes
+
+
+def narration_to_visual_prompt(narration, retries=2):
+    """
+    Uses Pollinations' free text endpoint to turn a chunk of narration
+    into a short, concrete visual stickman action description.
+    """
+    system_msg = (
+        "You convert narration into a single short visual scene description for a "
+        "minimalist stickman explainer video. Output ONLY the visual description "
+        "(one sentence, under 20 words), no preamble, no quotes, no timestamps. "
+        "Describe a concrete pose, action, or simple symbolic scene a stickman "
+        "illustrator could draw to represent the idea."
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": narration},
+        ],
+        "model": "openai",
+        "jsonMode": False,
+        "private": True,
+        "stream": False,
+    }
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(POLLINATIONS_TEXT_URL, json=payload, timeout=20)
+            if resp.status_code == 200 and resp.text.strip():
+                cleaned = resp.text.strip().strip('"')
+                return cleaned
+        except Exception:
+            pass
+        time.sleep(2)
+    # Fallback: just truncate the narration itself
+    return narration[:120]
+
+
+def generate_image_bytes(prompt, width, height, seed=None, retries=2):
+    encoded = urllib.parse.quote(prompt)
+    url = f"{POLLINATIONS_IMAGE_BASE}{encoded}"
+    params = {"width": width, "height": height, "nologo": "true"}
+    if seed is not None:
+        params["seed"] = seed
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            if resp.status_code == 200 and resp.content and len(resp.content) > 500:
+                return resp.content
+            if resp.status_code == 429:
+                time.sleep(MIN_SECONDS_BETWEEN_IMAGE_CALLS)
+                continue
+        except Exception:
+            pass
+        time.sleep(3)
+    return None
+
+
+# ============================================================
+# Layout
+# ============================================================
+tab_transcript, tab_scenes, tab_chat = st.tabs(
+    ["📄 1. Import Transcript", "🖼️ 2. Generate Images", "💬 3. Script Assistant"]
+)
+
+# ---------------- TAB 1: Import & convert transcript ----------------
+with tab_transcript:
+    st.subheader("Paste your raw narration transcript")
+    st.caption(
+        "Accepts VTT-style timing (`00:00 --> 00:05` on its own line, narration below it), "
+        "or pre-written scene actions like `[00:00 - 00:05] Stickman running`."
+    )
+    raw_text = st.text_area(
+        "Transcript",
+        value=st.session_state.raw_transcript_text,
+        height=280,
+        placeholder="00:00 --> 00:01\nNothing is wrong.\n\n00:02 --> 00:02\nYour job is fine.\n...",
+    )
+    st.session_state.raw_transcript_text = raw_text
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        target_seconds = st.slider("Group narration into scenes of about how many seconds?", 5, 30, 10)
+    with col_b:
+        st.write("")
+        st.write("")
+        convert_clicked = st.button("🪄 Convert transcript → stickman scenes", type="primary")
+
+    if convert_clicked:
+        if not raw_text.strip():
+            st.error("Paste a transcript first.")
+        else:
+            # Try VTT-style narration parsing first
+            blocks = parse_timed_transcript(raw_text)
+            scenes_out = []
+            if blocks:
+                grouped = group_into_scenes(blocks, target_seconds=target_seconds)
+                progress = st.progress(0)
+                status = st.empty()
+                for idx, sc in enumerate(grouped):
+                    status.text(f"Converting scene {idx+1}/{len(grouped)} to a visual prompt...")
+                    visual = narration_to_visual_prompt(sc["narration"])
+                    scenes_out.append({"timestamp": sc["timestamp"], "action": visual})
+                    progress.progress((idx + 1) / len(grouped))
+                status.text("Done.")
+            else:
+                # Fall back to already-written [timestamp] action lines
+                for line in raw_text.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.match(r"^\[(.*?)\]\s*(.*)$", line)
+                    if m:
+                        scenes_out.append({
+                            "timestamp": m.group(1).replace(":", "_").replace(" ", ""),
+                            "action": m.group(2).strip(),
+                        })
+            if scenes_out:
+                st.session_state.all_scenes = scenes_out
+                st.session_state.current_index = 0
+                st.success(f"Created {len(scenes_out)} scenes. Head to tab 2 to generate images.")
+            else:
+                st.error("Couldn't parse any scenes from that text — check the format.")
+
+    if st.session_state.all_scenes:
+        st.write("### Parsed scenes")
+        for i, s in enumerate(st.session_state.all_scenes):
+            st.write(f"**{i+1}. [{s['timestamp']}]** {s['action']}")
+
+# ---------------- TAB 2: Generate images ----------------
+with tab_scenes:
     total_scenes = len(st.session_state.all_scenes)
-    if total_scenes > 0:
+    if total_scenes == 0:
+        st.info("No scenes yet — import a transcript in Tab 1 first.")
+    else:
         current_idx = st.session_state.current_index
         st.write(f"### Progress: **{current_idx} / {total_scenes}** images generated")
-        
-        # Calculate batch ranges
-        end_idx = min(current_idx + 50, total_scenes)
-        batch_size = end_idx - current_idx
-        
-        # --- SHOW BACKUP COPY-PASTE UTILITY ---
-        st.info("💡 **Keep a backup of your work:** Copy the text below to keep a notepad backup of your project structure.")
-        backup_text = ""
-        for s in st.session_state.all_scenes:
-            backup_text += f"[{s['timestamp']}] {s['action']}\n"
-        st.text_area("Highlight and Copy this backup code:", value=backup_text.strip(), height=80)
-        
-        # Button: Execute Batch of 50
+
+        backup_text = "\n".join(
+            f"[{s['timestamp']}] {s['action']}" for s in st.session_state.all_scenes
+        )
+        with st.expander("💡 Backup your scene list (copy/paste text)"):
+            st.text_area("Backup", value=backup_text, height=100)
+
+        batch_size_choice = st.number_input(
+            "Batch size (images per click)", min_value=1, max_value=50, value=10, step=1
+        )
+        end_idx = min(current_idx + batch_size_choice, total_scenes)
+
         if current_idx < total_scenes:
-            btn_label = f"🚀 Execute Batch (Generate Scenes {current_idx+1} to {end_idx})"
-            if st.button(btn_label):
+            if st.button(f"🚀 Generate scenes {current_idx + 1}–{end_idx} of {total_scenes}"):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
-                batch_scenes = st.session_state.all_scenes[current_idx:end_idx]
-                
-                for idx, scene in enumerate(batch_scenes):
-                    timestamp_label = scene["timestamp"]
-                    action_text = scene["action"]
-                    
-                    full_prompt = f"{action_text}, {style_instruction}"
-                    status_text.text(f"Generating Image {idx+1}/{batch_size} ({timestamp_label})...")
-                    
-                    # --- RESILIENT FREE DUAL-PROVIDER FALLBACKS ---
-                    image_bytes = None
-                    encoded_prompt = urllib.parse.quote(full_prompt)
-                    
-                    # Provider 1: Enterprise-grade Puter.js Stable Diffusion 3 Engine (High Availability)
-                    url_puter = f"https://api.puter.com/v1/ai/txt2img?prompt={encoded_prompt}&model=stability-ai/stable-diffusion-3"
-                    
-                    # Try Puter First
-                    try:
-                        response = requests.get(url_puter, timeout=12)
-                        if response.status_code == 200 and response.content:
-                            # Verify response is raw image payload
-                            if b"PNG" in response.content[:10] or b"JFIF" in response.content[:10]:
-                                image_bytes = response.content
-                    except Exception:
-                        pass
-                    
-                    # Provider 2 Fallback: Hercai Stable Diffusion (Highly stable backup)
-                    if not image_bytes:
-                        try:
-                            status_text.text(f"Switching to Hercai visual fallback for {timestamp_label}...")
-                            url_herc = f"https://hercai.onrender.com/v3/text2image?prompt={encoded_prompt}"
-                            response = requests.get(url_herc, timeout=12)
-                            if response.status_code == 200:
-                                res_json = response.json()
-                                img_url = res_json.get("url")
-                                if img_url:
-                                    img_response = requests.get(img_url, timeout=10)
-                                    if img_response.status_code == 200:
-                                        image_bytes = img_response.content
-                        except Exception:
-                            pass
-                            
-                    # Final storage and render
-                    if image_bytes:
-                        filename = f"{timestamp_label}_scene_{current_idx + idx + 1}.png"
-                        st.session_state.generated_files[filename] = image_bytes
-                        st.image(image_bytes, caption=f"Generated: {filename}", width=250)
+                batch = st.session_state.all_scenes[current_idx:end_idx]
+                img_cols = st.columns(min(4, len(batch)))
+
+                for i, scene in enumerate(batch):
+                    label = scene["timestamp"]
+                    action = scene["action"]
+                    full_prompt = f"{action}, {style_instruction}"
+                    seed_val = (current_idx + i) if use_seed else None
+
+                    status_text.text(f"Generating {i+1}/{len(batch)}  —  {label}")
+                    img_bytes = generate_image_bytes(full_prompt, img_width, img_height, seed=seed_val)
+
+                    if img_bytes:
+                        fname = f"{label}_scene_{current_idx + i + 1}.png"
+                        st.session_state.generated_files[fname] = img_bytes
+                        with img_cols[i % len(img_cols)]:
+                            st.image(img_bytes, caption=fname, use_container_width=True)
                     else:
-                        st.error(f"❌ All free fallback providers timed out for scene {timestamp_label}. Try running again later.")
-                    
-                    progress_bar.progress((idx + 1) / batch_size)
-                    time.sleep(1)
-                
+                        st.error(f"❌ Pollinations timed out for scene {label} after retries. It will be skipped — you can re-run this batch to retry just the failures.")
+
+                    progress_bar.progress((i + 1) / len(batch))
+                    # Respect free-tier anonymous rate limit between requests
+                    if i < len(batch) - 1:
+                        time.sleep(MIN_SECONDS_BETWEEN_IMAGE_CALLS)
+
                 st.session_state.current_index = end_idx
-                st.success("Batch Complete!")
+                st.success("Batch complete!")
                 st.rerun()
         else:
             st.balloons()
-            st.success("🎉 All scenes generated successfully!")
+            st.success("🎉 All scenes generated!")
 
-    # Global Download Area (All batches unified into one ZIP)
     if st.session_state.generated_files:
         st.write("---")
-        st.subheader("📥 Download Studio Assets")
-        st.write(f"Currently compiled images in storage: **{len(st.session_state.generated_files)}**")
-        
+        st.subheader("📥 Download all images")
+        st.write(f"Images stored: **{len(st.session_state.generated_files)}**")
+
         zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
             for fname, fbytes in st.session_state.generated_files.items():
-                zip_file.writestr(fname, fbytes)
+                zf.writestr(fname, fbytes)
         zip_buffer.seek(0)
-        
-        col_dl, col_reset = st.columns([1, 1])
-        with col_dl:
+
+        c1, c2 = st.columns(2)
+        with c1:
             st.download_button(
-                label="📥 Download ZIP Folder (All Batches Combined)",
+                "📥 Download ZIP",
                 data=zip_buffer,
-                file_name=f"complete_storyboard_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                file_name=f"stickman_storyboard_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
                 mime="application/zip",
-                use_container_width=True
+                use_container_width=True,
             )
-        with col_reset:
-            if st.button("🧹 Clear Studio Storage (Reset)", use_container_width=True):
-                st.session_state.all_scenes = []
+        with c2:
+            if st.button("🧹 Clear all generated images", use_container_width=True):
                 st.session_state.generated_files = {}
                 st.session_state.current_index = 0
-                st.success("Studio storage completely cleared!")
+                st.success("Cleared.")
                 st.rerun()
+
+# ---------------- TAB 3: Chat assistant ----------------
+with tab_chat:
+    st.subheader("Script & prompt assistant")
+    st.caption("Free text chat via Pollinations — ask it to draft narration, suggest scene splits, or tweak stickman prompts.")
+
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if user_msg := st.chat_input("e.g. 'Split this into 8 stickman scenes about the hedonic treadmill'"):
+        st.session_state.chat_messages.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("🧠 *thinking...*")
+            system_instruction = (
+                "You are an expert short-video producer. Write concise, engaging scripts with "
+                "clear timestamp brackets like [00:00 - 00:05], and suggest a matching minimalist "
+                "stickman visual for each line."
+            )
+            messages_payload = [{"role": "system", "content": system_instruction}]
+            messages_payload += st.session_state.chat_messages[-6:]
+            reply = None
+            try:
+                resp = requests.post(
+                    POLLINATIONS_TEXT_URL,
+                    json={"messages": messages_payload, "model": "openai", "jsonMode": False, "private": True, "stream": False},
+                    timeout=20,
+                )
+                if resp.status_code == 200 and resp.text.strip():
+                    reply = resp.text.strip()
+            except Exception:
+                pass
+            reply = reply or "The free text service timed out — try again in a moment."
+            placeholder.markdown(reply)
+            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
