@@ -25,6 +25,8 @@ st.caption("Bulk-generate stickman scene images from a timestamped transcript �
 POLLINATIONS_IMAGE_BASE = "https://image.pollinations.ai/prompt/"
 POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/"
 MIN_SECONDS_BETWEEN_IMAGE_CALLS = 16  # anonymous rate limit is ~1 req/15s
+DEFAULT_REFERRER = "stickman-storyboard-studio"  # server-side calls send no browser Referer by default,
+                                                  # and Pollinations' free tier increasingly wants one set
 
 # ---------------- Session state ----------------
 defaults = {
@@ -35,6 +37,8 @@ defaults = {
     "raw_transcript_text": "",
     "style_ref_description": "",     # text description of uploaded reference images' style
     "style_ref_uploaded_names": [],  # names of files already analyzed, to avoid re-analyzing
+    "pollinations_token": "",        # optional free token from auth.pollinations.ai
+    "pollinations_referrer": "",     # optional referrer string
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -43,6 +47,51 @@ for k, v in defaults.items():
 
 import base64
 import mimetypes
+
+
+def pollinations_auth():
+    """
+    Returns (extra_query_params, extra_headers). A referrer is always included
+    since server-side requests send no browser Referer header, and Pollinations'
+    free tier increasingly wants one for anonymous traffic. A free token from
+    auth.pollinations.ai (optional, set in the sidebar) raises limits further.
+    """
+    token = st.session_state.get("pollinations_token", "").strip()
+    referrer = st.session_state.get("pollinations_referrer", "").strip() or DEFAULT_REFERRER
+    params = {"referrer": referrer}
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return params, headers
+
+
+def call_pollinations_chat(messages, timeout=30):
+    """
+    Calls Pollinations' OpenAI-compatible chat endpoint (handles both plain text
+    and vision messages). Tries the primary text.pollinations.ai/openai endpoint,
+    then falls back to gen.pollinations.ai/openai if the first fails — some
+    anonymous traffic gets routed differently between the two.
+    Returns (content, error_message).
+    """
+    extra_params, extra_headers = pollinations_auth()
+    headers = {"Content-Type": "application/json", **extra_headers}
+    payload = {"model": "openai", "messages": messages}
+
+    last_error = None
+    for base in (f"{POLLINATIONS_TEXT_URL}openai", "https://gen.pollinations.ai/openai"):
+        try:
+            resp = requests.post(base, json=payload, params=extra_params, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                if content:
+                    return content, None
+                last_error = "Received an empty response."
+            else:
+                last_error = f"{base} → HTTP {resp.status_code}: {resp.text[:300]}"
+        except Exception as e:
+            last_error = f"{base} → request failed: {e}"
+    return None, last_error
 
 
 def describe_style_from_images(image_files):
@@ -70,27 +119,7 @@ def describe_style_from_images(image_files):
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         })
-
-    payload = {
-        "model": "openai",
-        "messages": [{"role": "user", "content": content}],
-    }
-    try:
-        resp = requests.post(
-            f"{POLLINATIONS_TEXT_URL}openai",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=40,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            text = data["choices"][0]["message"]["content"].strip()
-            if text:
-                return text, None
-            return None, "Vision model returned an empty description."
-        return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
-    except Exception as e:
-        return None, f"Request failed: {e}"
+    return call_pollinations_chat([{"role": "user", "content": content}], timeout=40)
 
 
 # ---------------- Sidebar: style ----------------
@@ -150,6 +179,20 @@ with st.sidebar:
     img_height = st.selectbox("Height", [512, 640, 768, 1024], index=1)
     use_seed = st.checkbox("Use a fixed seed per scene (more consistent style)", value=True)
     st.caption(f"Pacing: ~1 image every {MIN_SECONDS_BETWEEN_IMAGE_CALLS}s to respect Pollinations' free anonymous rate limit.")
+
+    st.write("---")
+    st.header("🔑 Reliability (optional)")
+    st.caption(
+        "Anonymous free-tier calls can get rate-limited or rejected. A free token from "
+        "[auth.pollinations.ai](https://auth.pollinations.ai) raises those limits — not required, but helps."
+    )
+    st.session_state.pollinations_token = st.text_input(
+        "Free Pollinations token (optional)", value=st.session_state.pollinations_token, type="password"
+    )
+    st.session_state.pollinations_referrer = st.text_input(
+        "Referrer / app name (optional)", value=st.session_state.pollinations_referrer,
+        placeholder=DEFAULT_REFERRER,
+    )
 
     st.write("---")
     st.header("💾 Session Recovery")
@@ -251,28 +294,14 @@ def narration_to_visual_prompt(narration, retries=2):
         "Describe a concrete pose, action, or simple symbolic scene a stickman "
         "illustrator could draw to represent the idea."
     )
-    payload = {
-        "model": "openai",
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": narration},
-        ],
-    }
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": narration},
+    ]
     for attempt in range(retries + 1):
-        try:
-            resp = requests.post(
-                f"{POLLINATIONS_TEXT_URL}openai",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                cleaned = data["choices"][0]["message"]["content"].strip().strip('"')
-                if cleaned:
-                    return cleaned
-        except Exception:
-            pass
+        content, err = call_pollinations_chat(messages, timeout=20)
+        if content:
+            return content.strip('"')
         time.sleep(2)
     # Fallback: just truncate the narration itself
     return narration[:120]
@@ -281,12 +310,13 @@ def narration_to_visual_prompt(narration, retries=2):
 def generate_image_bytes(prompt, width, height, seed=None, retries=2):
     encoded = urllib.parse.quote(prompt)
     url = f"{POLLINATIONS_IMAGE_BASE}{encoded}"
-    params = {"width": width, "height": height, "nologo": "true"}
+    extra_params, extra_headers = pollinations_auth()
+    params = {"width": width, "height": height, "nologo": "true", **extra_params}
     if seed is not None:
         params["seed"] = seed
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=30)
+            resp = requests.get(url, params=params, headers=extra_headers, timeout=30)
             if resp.status_code == 200 and resp.content and len(resp.content) > 500:
                 return resp.content
             if resp.status_code == 429:
@@ -500,15 +530,30 @@ with tab_scenes:
 # ---------------- TAB 3: Chat assistant ----------------
 with tab_chat:
     st.subheader("Script & prompt assistant")
-    st.caption("Free text chat via Pollinations — ask it to draft narration, suggest scene splits, or tweak stickman prompts.")
+    st.caption("Free text chat via Pollinations — ask it to draft narration, suggest scene splits, or tweak stickman prompts. Attach an image for it to look at, too.")
 
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
+            if msg.get("image_preview"):
+                st.image(msg["image_preview"], width=200)
             st.markdown(msg["content"])
 
+    chat_attachment = st.file_uploader(
+        "📎 Attach an image (optional)", type=["png", "jpg", "jpeg"], key="chat_image_uploader"
+    )
+    if chat_attachment:
+        st.image(chat_attachment, caption="Attached — will be sent with your next message", width=150)
+
     if user_msg := st.chat_input("e.g. 'Split this into 8 stickman scenes about the hedonic treadmill'"):
-        st.session_state.chat_messages.append({"role": "user", "content": user_msg})
+        attached_bytes = chat_attachment.getvalue() if chat_attachment else None
+        attached_name = chat_attachment.name if chat_attachment else None
+
+        st.session_state.chat_messages.append({
+            "role": "user", "content": user_msg, "image_preview": attached_bytes
+        })
         with st.chat_message("user"):
+            if attached_bytes:
+                st.image(attached_bytes, width=200)
             st.markdown(user_msg)
 
         with st.chat_message("assistant"):
@@ -517,23 +562,30 @@ with tab_chat:
             system_instruction = (
                 "You are an expert short-video producer. Write concise, engaging scripts with "
                 "clear timestamp brackets like [00:00 - 00:05], and suggest a matching minimalist "
-                "stickman visual for each line."
+                "stickman visual for each line. If an image is attached, use it as context or "
+                "style inspiration as relevant to the request."
             )
             messages_payload = [{"role": "system", "content": system_instruction}]
-            messages_payload += st.session_state.chat_messages[-6:]
-            reply = None
-            try:
-                resp = requests.post(
-                    f"{POLLINATIONS_TEXT_URL}openai",
-                    json={"model": "openai", "messages": messages_payload},
-                    headers={"Content-Type": "application/json"},
-                    timeout=20,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    reply = data["choices"][0]["message"]["content"].strip()
-            except Exception:
-                pass
-            reply = reply or "The free text service timed out — try again in a moment."
+
+            # Replay recent history as plain text (attachments are only sent live, not replayed)
+            for m in st.session_state.chat_messages[-6:-1]:
+                messages_payload.append({"role": m["role"], "content": m["content"]})
+
+            # Current turn: attach the image inline if present
+            if attached_bytes:
+                mime = mimetypes.guess_type(attached_name or "image.jpg")[0] or "image/jpeg"
+                b64 = base64.b64encode(attached_bytes).decode()
+                messages_payload.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_msg},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    ],
+                })
+            else:
+                messages_payload.append({"role": "user", "content": user_msg})
+
+            reply, err = call_pollinations_chat(messages_payload, timeout=40)
+            reply = reply or f"The free text service didn't respond ({err}). Try again in a moment."
             placeholder.markdown(reply)
-            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+            st.session_state.chat_messages.append({"role": "assistant", "content": reply, "image_preview": None})
